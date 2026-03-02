@@ -75,7 +75,7 @@ def tokenize_tiktoken(ds):
 @app.function
 def save(ds, save_path):
     ds.set_format(type='torch', columns=['input_ids'])
-    
+
     ds_train = torch.cat(ds["train"]["input_ids"][:])
     ds_val = torch.cat(ds["test"]["input_ids"][:])
 

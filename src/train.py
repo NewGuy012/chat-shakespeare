@@ -20,24 +20,24 @@ def get_batch_loader(config, split):
     batch_size = config["batch_size"]
     block_size = config["block_size"]
     device  = config["device"]
-    
+
     file_name = "train-validation.safetensors"
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
-    
+
     with safe_open(file_path, framework="pt", device="cpu") as f:
             # Access tensors by name
             data = f.get_tensor(split)
-    
+
     data_length = len(data)
     quotient = (data_length // block_size)-1
     truncate_length = block_size * quotient
-    
+
     x = data[:truncate_length].view(-1, block_size)
     y = data[1:truncate_length+1].view(-1, block_size)
-    
+
     dataset = TensorDataset(x, y)
-    
+
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     return loader
@@ -232,7 +232,7 @@ def train_sequential_batches(config, model, optimizer):
 
     loader = get_batch_loader(config, "train")
     loader_iter = iter(loader)
-    
+
     # training loop
     for iter_num in range(max_iters):
         # determine and set the learning rate for this iteration

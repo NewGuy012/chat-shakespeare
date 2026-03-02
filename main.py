@@ -12,47 +12,49 @@ with app.setup:
     from train import initialize_model, train_sequential_batches
     from sample import SampleConfig, sample
 
+    from accelerate import Accelerator
+
 
 @app.cell
-def _(save):
-    ### Tokenize ###
-    file_name = "train-validation.safetensors"
-    root_file = Path(__file__).parent
-    save_path = root_file / "data" / file_name
+def _():
+    # ### Tokenize ###
+    # file_name = "train-validation.safetensors"
+    # root_file = Path(__file__).parent
+    # save_path = root_file / "data" / file_name
 
-    if not save_path.exists():
-        ds = download()
-        ds_tok = tokenize(ds)
-        save(ds, save_path)
+    # if not save_path.exists():
+    #     ds = download()
+    #     ds_tok = tokenize(ds)
+    #     save(ds, save_path)
     return
 
 
 @app.cell
 def _():
-    ### Hyperpameters ###
-    hyper_config = intialize_hyperparameters(
-        batch_size = 6,
-        block_size = 12,
-        n_layer = 2,
-        n_head = 2,
-        n_embd = 128,
-        dropout = 0.0,
-        learning_rate = 3e-3,
-        max_iters = 50)
-    return (hyper_config,)
+    # ### Hyperpameters ###
+    # hyper_config = intialize_hyperparameters(
+    #     batch_size = 6,
+    #     block_size = 12,
+    #     n_layer = 2,
+    #     n_head = 2,
+    #     n_embd = 128,
+    #     dropout = 0.0,
+    #     learning_rate = 3e-3,
+    #     max_iters = 50)
+    return
 
 
 @app.cell
-def _(hyper_config):
-    ### Model ###
-    model, optimizer = initialize_model(hyper_config)
-    return model, optimizer
+def _():
+    # ### Model ###
+    # model, optimizer = initialize_model(hyper_config)
+    return
 
 
 @app.cell
-def _(hyper_config, model, optimizer):
-    ### Train ###
-    train_sequential_batches(hyper_config, model, optimizer)
+def _():
+    # ### Train ###
+    # train_sequential_batches(hyper_config, model, optimizer)
     return
 
 

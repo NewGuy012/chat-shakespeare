@@ -48,17 +48,18 @@ dropout=0.0
 
 device=gpu
 -------------
-compile=False
-eval_iters=20
-log_interval=1
-block_size=64
-batch_size=12
-n_layer=4
-n_head=4
-n_embd=128
-max_iters=2000
-lr_decay_iters=2000
-dropout=0.0
+batch_size = 64
+block_size = 256
+n_layer = 6
+n_head = 6
+n_embd = 384
+dropout = 0.2
+learning_rate = 1e-3
+max_iters = 5000
+lr_decay_iters = 5000
+min_lr = 1e-4
+beta2 = 0.99
+warmup_iters = 100
 ```
 
 3. For using GPU compute on cloud, I'd recommend Thunder Compute
@@ -74,7 +75,7 @@ Moses Yoo, juyoung.m.yoo at gmail dot com.
 
 ## License
 
-This project is licensed under the BSD 1-Clause license. See the LICENSE.md file for details.
+This project is licensed under the BSD 2-Clause license. See the LICENSE.md file for details.
 
 ## Acknowledgments
 
