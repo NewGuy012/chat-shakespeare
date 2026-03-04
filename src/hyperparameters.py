@@ -6,6 +6,7 @@ app = marimo.App(width="full", sql_output="native")
 with app.setup:
     import marimo as mo
     import typer
+    import torch
     from rich import print
     from rich.pretty import pprint
 
@@ -40,65 +41,88 @@ def _():
     return
 
 
-@app.function
-# app = typer.Typer()
+app._unparsable_cell(
+    r"""
+    def determine_device():
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        print(f"using device: {device}")
 
-# @app.command()
-def intialize_hyperparameters(
-    batch_size: int = 4,
-    block_size: int = 8,
-    vocab_size = 50304,
-    n_layer: int = 2,
-    n_head: int = 2,
-    n_embd: int = 64,
-    dropout: float = 0.0,
-    weight_decay: float = 1e-1,
-    learning_rate: float = 3e-4,
-    max_iters: int = 20,
-    epoch_iters: int = 1,
-    warmup_iters: int = 0,
-    lr_decay_iters: int = 2000,
-    min_lr: float = 1e-4,
-    beta1: float = 0.9,
-    beta2: float = 0.99,
-    bias: bool = False,
-    compile: bool = False,
-    eval_iters: int = 20,
-    eval_interval: int = 1,
-    device: str = "cpu",
-    init_from: str = "scratch"):
+        compile = False
+        if device == "cuda"
+            compile = True
+        print(f"using compile set to {compile}")
 
-    if compile == "gpu":
-        compile = True
+        return device, compile
+    """,
+    name="_"
+)
 
-    config_dict = {
-        "batch_size": batch_size,
-        "block_size": block_size,
-        "vocab_size": vocab_size,
-        "n_layer": n_layer,
-        "n_head": n_head,
-        "n_embd": n_embd,
-        "dropout": dropout,
-        "weight_decay": weight_decay,
-        "learning_rate": learning_rate,
-        "max_iters": max_iters,
-        "epoch_iters": epoch_iters,
-        "warmup_iters": warmup_iters,
-        "lr_decay_iters": lr_decay_iters,
-        "min_lr": min_lr,
-        "beta1": beta1,
-        "beta2": beta2,
-        "bias": bias,
-        "compile": compile,
-        "eval_iters": eval_iters,
-        "eval_interval": eval_interval,
-        "device": device,
-        "init_from": init_from
-    }
 
-    print(config_dict)
+@app.cell
+def _(determine_device):
+    # app = typer.Typer()
 
-    return config_dict
+    # @app.command()
+    def intialize_hyperparameters(
+        batch_size: int = 4,
+        block_size: int = 8,
+        vocab_size = 50304,
+        n_layer: int = 2,
+        n_head: int = 2,
+        n_embd: int = 64,
+        dropout: float = 0.0,
+        weight_decay: float = 1e-1,
+        learning_rate: float = 3e-4,
+        max_iters: int = 20,
+        epoch_iters: int = 1,
+        warmup_iters: int = 0,
+        lr_decay_iters: int = 2000,
+        min_lr: float = 1e-4,
+        beta1: float = 0.9,
+        beta2: float = 0.99,
+        bias: bool = False,
+        compile: bool = False,
+        eval_iters: int = 20,
+        eval_interval: int = 1,
+        device: str = "cpu",
+        init_from: str = "scratch"):
+
+        device, compile = determine_device()
+
+        config_dict = {
+            "batch_size": batch_size,
+            "block_size": block_size,
+            "vocab_size": vocab_size,
+            "n_layer": n_layer,
+            "n_head": n_head,
+            "n_embd": n_embd,
+            "dropout": dropout,
+            "weight_decay": weight_decay,
+            "learning_rate": learning_rate,
+            "max_iters": max_iters,
+            "epoch_iters": epoch_iters,
+            "warmup_iters": warmup_iters,
+            "lr_decay_iters": lr_decay_iters,
+            "min_lr": min_lr,
+            "beta1": beta1,
+            "beta2": beta2,
+            "bias": bias,
+            "compile": compile,
+            "eval_iters": eval_iters,
+            "eval_interval": eval_interval,
+            "device": device,
+            "init_from": init_from
+        }
+
+        print(config_dict)
+
+        return config_dict
+
+    return
 
 
 if __name__ == "__main__":

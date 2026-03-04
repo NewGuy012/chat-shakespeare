@@ -33,14 +33,14 @@ def _(save):
 def _():
     ### Hyperpameters ###
     hyper_config = intialize_hyperparameters(
-        batch_size = 6,
-        block_size = 12,
-        n_layer = 4,
-        n_head = 4,
-        n_embd = 128,
-        dropout = 0.0,
-        learning_rate = 3e-3,
-        max_iters = 100,
+        batch_size = 64,
+        block_size = 256,
+        n_layer = 6,
+        n_head = 6,
+        n_embd = 384,
+        dropout = 0.1,
+        learning_rate = 1e-3,
+        max_iters = 5000,
         epoch_iters = 1 # This overrides max_iters
     )
     return (hyper_config,)
