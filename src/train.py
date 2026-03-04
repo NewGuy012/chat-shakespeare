@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.20.2"
+__generated_with = "0.20.4"
 app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
@@ -25,13 +25,15 @@ def get_batch_loader(config, split):
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
 
-    with safe_open(file_path, framework="pt", device="cpu") as f:
+    with safe_open(file_path, framework="pt", device=device) as f:
             # Access tensors by name
             data = f.get_tensor(split)
 
     data_length = len(data)
     quotient = (data_length // block_size)-1
     truncate_length = block_size * quotient
+    epoch_batches = data_length // (batch_size * block_size)
+    print(f"1 epoch = {epoch_batches} batches")
 
     x = data[:truncate_length].view(-1, block_size)
     y = data[1:truncate_length+1].view(-1, block_size)
@@ -40,7 +42,7 @@ def get_batch_loader(config, split):
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-    return loader
+    return loader, epoch_batches
 
 
 @app.function
@@ -53,7 +55,7 @@ def get_batch_slice(config, split):
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
 
-    with safe_open(file_path, framework="pt", device="cpu") as f:
+    with safe_open(file_path, framework="pt", device=device) as f:
         tensor_slice = f.get_slice(split)
         data = tensor_slice[:batch_size*block_size + 1]
 
@@ -75,7 +77,7 @@ def get_batch_random(config, split):
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
 
-    with safe_open(file_path, framework="pt", device="cpu") as f:
+    with safe_open(file_path, framework="pt", device=device) as f:
         # Access tensors by name
         data = f.get_tensor(split)
 
@@ -227,11 +229,17 @@ def train_random_batches(config, model, optimizer):
 @app.function
 def train_sequential_batches(config, model, optimizer):
     max_iters = config["max_iters"]
+    epoch_iters = config["epoch_iters"]
     lr_decay_iters = config["lr_decay_iters"]
     eval_interval = config["eval_interval"]
+    device  = config["device"]
 
-    loader = get_batch_loader(config, "train")
+    loader, epoch_batches = get_batch_loader(config, "train")
     loader_iter = iter(loader)
+
+    if epoch_iters != 0:
+        max_iters = epoch_batches * epoch_iters
+        print(f"Iterating for {epoch_iters} epoch(es) or {max_iters} iterations")
 
     # training loop
     for iter_num in range(max_iters):
@@ -248,7 +256,8 @@ def train_sequential_batches(config, model, optimizer):
             print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["validation"]:.4f}")
 
         # sample a batch of data
-        X, Y  = next(loader_iter)
+        x, y  = next(loader_iter)
+        X, Y = x.to(device), y.to(device)
 
         # evaluate the loss
         logits, loss = model(X, Y)

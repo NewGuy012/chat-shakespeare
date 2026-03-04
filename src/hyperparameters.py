@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.20.2"
+__generated_with = "0.20.4"
 app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
@@ -55,6 +55,7 @@ def intialize_hyperparameters(
     weight_decay: float = 1e-1,
     learning_rate: float = 3e-4,
     max_iters: int = 20,
+    epoch_iters: int = 1,
     warmup_iters: int = 0,
     lr_decay_iters: int = 2000,
     min_lr: float = 1e-4,
@@ -67,6 +68,9 @@ def intialize_hyperparameters(
     device: str = "cpu",
     init_from: str = "scratch"):
 
+    if compile == "gpu":
+        compile = True
+
     config_dict = {
         "batch_size": batch_size,
         "block_size": block_size,
@@ -78,6 +82,7 @@ def intialize_hyperparameters(
         "weight_decay": weight_decay,
         "learning_rate": learning_rate,
         "max_iters": max_iters,
+        "epoch_iters": epoch_iters,
         "warmup_iters": warmup_iters,
         "lr_decay_iters": lr_decay_iters,
         "min_lr": min_lr,
