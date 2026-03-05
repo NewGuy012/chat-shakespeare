@@ -21,7 +21,7 @@ def get_batch_loader(config, split):
     block_size = config["block_size"]
     device  = config["device"]
 
-    file_name = "train-validation.safetensors"
+    file_name = f"{split}.safetensors"
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
 
@@ -51,7 +51,7 @@ def get_batch_slice(config, split):
     block_size = config["block_size"]
     device  = config["device"]
 
-    file_name = "train-validation.safetensors"
+    file_name = f"{split}.safetensors"
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
 
@@ -73,7 +73,7 @@ def get_batch_random(config, split):
     batch_size = config["batch_size"]
     device  = config["device"]
 
-    file_name = "train-validation.safetensors"
+    file_name = f"{split}.safetensors"
     root_file = Path(__file__).parent.parent
     file_path = root_file / "data" / file_name
 
@@ -99,7 +99,7 @@ def estimate_loss(config, model):
 
     out = {}
     model.eval()
-    for split in ["train", "validation"]:
+    for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch_random(config, split)
@@ -243,6 +243,25 @@ def train_sequential_batches(config, model, optimizer):
 
     # training loop
     for iter_num in range(max_iters):
+        if iter_num % epoch_batches == 0 and iter_num != 0:
+            loader, epoch_batches = get_batch_loader(config, "train")
+            loader_iter = iter(loader)
+            
+        # sample a batch of data
+        x, y  = next(loader_iter)
+        X, Y = x.to(device), y.to(device)
+
+        # evaluate the loss
+        logits, loss = model(X, Y)
+        
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        # clip the gradient
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        optimizer.step()
+
         # determine and set the learning rate for this iteration
         if lr_decay_iters > max_iters:
             lr = get_lr(config, iter_num)
@@ -253,17 +272,26 @@ def train_sequential_batches(config, model, optimizer):
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
             losses = estimate_loss(config, model)
-            print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["validation"]:.4f}")
+            print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}, norm: {norm:.4f}")
 
-        # sample a batch of data
-        x, y  = next(loader_iter)
-        X, Y = x.to(device), y.to(device)
+    return losses, norm
 
-        # evaluate the loss
-        logits, loss = model(X, Y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+
+@app.function
+def save_checkpoint(config, model, optimizer, losses):
+    root_path = config["root_path"]
+    checkpoint_path = root_path / "data" / "checkpoint.pt"
+
+    if not checkpoint_path.exists():
+        # Save model to checkpoint
+        checkpoint_dict = {
+        "config": config,
+        "model_state_dict": model.state_dict(),
+        "optimzer_state_dict": optimizer.state_dict(),
+        "losses": losses,
+        }
+        
+        torch.save(checkpoint_dict, checkpoint_path)
 
 
 if __name__ == "__main__":

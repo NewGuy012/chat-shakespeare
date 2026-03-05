@@ -1,10 +1,11 @@
 import marimo
 
-__generated_with = "0.20.2"
+__generated_with = "0.20.4"
 app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
     import torch
+    import pickle
     import tiktoken
     import marimo as mo
     from dataclasses import dataclass
@@ -13,6 +14,7 @@ with app.setup:
 @app.class_definition
 @dataclass
 class SampleConfig:
+    load_meta: bool = False
     start: str = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
     num_samples: int = 1 # number of samples to draw
     max_new_tokens: int = 500 # number of tokens generated in each sample
@@ -21,10 +23,12 @@ class SampleConfig:
 
 
 @app.function
-def sample(hyper_config, sample_config, model):
-    device  = hyper_config["device"]
-    compile = hyper_config["compile"]
+def sample(config, sample_config, model):
+    root_path = config["root_path"]
+    device  = config["device"]
+    compile = config["compile"]
 
+    load_meta = sample_config.load_meta
     start = sample_config.start
     num_samples = sample_config.num_samples
     max_new_tokens = sample_config.max_new_tokens
@@ -36,10 +40,20 @@ def sample(hyper_config, sample_config, model):
     if compile:
         model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
-    # ok let's assume gpt-2 encodings by default
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
+    if load_meta:
+        meta_path = root_path / "data" / "meta.pkl"
+        
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        
+        stoi, itos = meta['stoi'], meta['itos']
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda l: ''.join([itos[i] for i in l])
+    else:
+        # ok let's assume gpt-2 encodings by default
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+        decode = lambda l: enc.decode(l)
 
     # encode the beginning of the prompt
     if start.startswith("FILE:"):

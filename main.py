@@ -4,68 +4,83 @@ __generated_with = "0.20.4"
 app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
+    import pickle 
     import marimo as mo
     from pathlib import Path
 
-    from tokenizer import download, tokenize
+    from tokenizer import download, tokenize, tokenize_char, save_tensors
     from hyperparameters import intialize_hyperparameters
-    from train import initialize_model, train_sequential_batches
+    from train import initialize_model, train_sequential_batches, save_checkpoint
     from sample import SampleConfig, sample
-
-    from accelerate import Accelerator
-
-
-@app.cell
-def _(save):
-    ### Tokenize ###
-    file_name = "train-validation.safetensors"
-    root_file = Path(__file__).parent
-    save_path = root_file / "data" / file_name
-
-    if not save_path.exists():
-        ds = download()
-        ds_tok = tokenize(ds)
-        save(ds, save_path)
-    return
 
 
 @app.cell
 def _():
     ### Hyperpameters ###
-    hyper_config = intialize_hyperparameters(
-        batch_size = 64,
-        block_size = 256,
-        n_layer = 6,
-        n_head = 6,
-        n_embd = 384,
-        dropout = 0.1,
-        learning_rate = 1e-3,
-        max_iters = 5000,
-        epoch_iters = 1 # This overrides max_iters
+    cpu_config = intialize_hyperparameters(
+        batch_size = 8,
+        block_size = 32,
+        n_layer = 4,
+        n_head = 4,
+        n_embd = 64,
+        dropout = 0,
+        learning_rate = 3e-3,
+        max_iters = 1000,
+        epoch_iters = 0, # This overrides max_iters
+        beta2 = 0.99,
+        eval_interval = 20
     )
-    return (hyper_config,)
+
+    # gpu_config = intialize_hyperparameters(
+    #     batch_size = 64,
+    #     block_size = 256,
+    #     n_layer = 6,
+    #     n_head = 6,
+    #     n_embd = 384,
+    #     dropout = 0.1,
+    #     learning_rate = 1e-3,
+    #     max_iters = 5000,
+    #     epoch_iters = 1, # This overrides max_iters
+    #     eval_interval = 20
+    # )
+
+    cpu_config
+    return (cpu_config,)
 
 
 @app.cell
-def _(hyper_config):
-    ### Model ###
-    model, optimizer = initialize_model(hyper_config)
-    return model, optimizer
+def _(cpu_config):
+    ### Tokenize ###
+    tensor_path = cpu_config["root_path"] / "data" / "train.safetensors"
 
-
-@app.cell
-def _(hyper_config, model, optimizer):
-    ### Train ###
-    train_sequential_batches(hyper_config, model, optimizer)
+    if not tensor_path.exists():
+        ds = download()
+        ds_tok = tokenize_char(cpu_config, ds)
+        save_tensors(cpu_config, ds_tok)
     return
 
 
 @app.cell
-def _(hyper_config, model):
+def _(cpu_config):
+    ### Model ###
+    model, optimizer = initialize_model(cpu_config)
+    return model, optimizer
+
+
+@app.cell
+def _(cpu_config, model, optimizer):
+    ### Train ###
+    losses, _ = train_sequential_batches(cpu_config, model, optimizer)
+    save_checkpoint(cpu_config, model, optimizer, losses)
+    return
+
+
+@app.cell
+def _(cpu_config, model):
     ### Sample ###
-    sample_config = SampleConfig()
-    print(sample_config)
-    sample(hyper_config, sample_config, model)
+    sample_config = SampleConfig(load_meta = True)
+    sample_config
+    sample(cpu_config, sample_config, model)
     return
 
 
