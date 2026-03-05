@@ -19,16 +19,16 @@ def _():
     ### Hyperpameters ###
     cpu_config = intialize_hyperparameters(
         batch_size = 8,
-        block_size = 32,
+        block_size = 64,
         n_layer = 4,
         n_head = 4,
         n_embd = 64,
         dropout = 0,
         learning_rate = 3e-3,
-        max_iters = 1000,
+        max_iters = 2000,
         epoch_iters = 0, # This overrides max_iters
         beta2 = 0.99,
-        eval_interval = 20
+        eval_interval = 100
     )
 
     # gpu_config = intialize_hyperparameters(
@@ -40,8 +40,8 @@ def _():
     #     dropout = 0.1,
     #     learning_rate = 1e-3,
     #     max_iters = 5000,
-    #     epoch_iters = 1, # This overrides max_iters
-    #     eval_interval = 20
+    #     epoch_iters = 0, # This overrides max_iters
+    #     eval_interval = 500
     # )
 
     cpu_config
