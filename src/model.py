@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.20.2"
+__generated_with = "0.20.4"
 app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
@@ -12,6 +12,8 @@ with app.setup:
     import torch
     import torch.nn as nn
     from torch.nn import functional as F
+
+    torch.set_float32_matmul_precision('high')
 
 
 @app.class_definition
