@@ -17,7 +17,7 @@ with app.setup:
 
 
 @app.function
-def download(config):
+def download():
     # jchwenger/tiny_shakespeare 
     dataset = load_dataset("Trelis/tiny-shakespeare")
     dataset = dataset.rename_column("Text", "text")
@@ -130,7 +130,7 @@ def decode_char(itos_dict, l):
 @app.function
 def save_meta(config, meta):
     root_path = config["root_path"]
-    
+
     save_path = root_path / "data" / "meta.pkl"
 
     with open(save_path, 'wb') as f:

@@ -44,19 +44,23 @@ def _():
     #     eval_interval = 500
     # )
 
-    cpu_config
-    return (cpu_config,)
+    config = cpu_config
+    config
+    return config, cpu_config
 
 
 @app.cell
-def _(cpu_config):
+def _(config):
     ### Tokenize ###
-    tensor_path = cpu_config["root_path"] / "data" / "train.safetensors"
+    data_path = config["root_path"] / "data"
+    tensor_path = data_path / "train.safetensors"
+
+    data_path.mkdir(parents=True, exist_ok=True)
 
     if not tensor_path.exists():
         ds = download()
-        ds_tok = tokenize_char(cpu_config, ds)
-        save_tensors(cpu_config, ds_tok)
+        ds_tok = tokenize_char(config, ds)
+        save_tensors(config, ds_tok)
     return
 
 
@@ -68,19 +72,19 @@ def _(cpu_config):
 
 
 @app.cell
-def _(cpu_config, model, optimizer):
+def _(config, model, optimizer):
     ### Train ###
-    losses, _ = train_sequential_batches(cpu_config, model, optimizer)
-    save_checkpoint(cpu_config, model, optimizer, losses)
+    losses, _ = train_sequential_batches(config, model, optimizer)
+    save_checkpoint(config, model, optimizer, losses)
     return
 
 
 @app.cell
-def _(cpu_config, model):
+def _(config, model):
     ### Sample ###
     sample_config = SampleConfig(load_meta = True)
     sample_config
-    sample(cpu_config, sample_config, model)
+    sample(config, sample_config, model)
     return
 
 
