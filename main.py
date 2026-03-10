@@ -31,22 +31,22 @@ def _():
         eval_interval = 100
     )
 
-    # gpu_config = intialize_hyperparameters(
-    #     batch_size = 64,
-    #     block_size = 256,
-    #     n_layer = 6,
-    #     n_head = 6,
-    #     n_embd = 384,
-    #     dropout = 0.1,
-    #     learning_rate = 1e-3,
-    #     max_iters = 5000,
-    #     epoch_iters = 0, # This overrides max_iters
-    #     eval_interval = 500
-    # )
+    gpu_config = intialize_hyperparameters(
+        batch_size = 64,
+        block_size = 256,
+        n_layer = 6,
+        n_head = 6,
+        n_embd = 384,
+        dropout = 0.1,
+        learning_rate = 1e-3,
+        max_iters = 5000,
+        epoch_iters = 3, # This overrides max_iters
+        eval_interval = 10
+    )
 
     config = cpu_config
     config
-    return config, cpu_config
+    return (config,)
 
 
 @app.cell
@@ -65,9 +65,9 @@ def _(config):
 
 
 @app.cell
-def _(cpu_config):
+def _(config):
     ### Model ###
-    model, optimizer = initialize_model(cpu_config)
+    model, optimizer = initialize_model(config)
     return model, optimizer
 
 
