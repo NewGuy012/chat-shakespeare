@@ -9,7 +9,7 @@ with app.setup:
     import tiktoken
     import marimo as mo
 
-    from pathlib import Path, WindowsPath
+    from pathlib import Path, WindowsPath, PosixPath
     from dataclasses import dataclass
     from train import initialize_model
     from hyperparameters import determine_device
@@ -31,7 +31,7 @@ class SampleConfig:
 def load_checkpoint(checkpoint_path):
     device, _ = determine_device()
 
-    torch.serialization.add_safe_globals([WindowsPath])
+    torch.serialization.add_safe_globals([WindowsPath, PosixPath])
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     config = checkpoint["config"]

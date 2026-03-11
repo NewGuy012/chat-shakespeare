@@ -41,7 +41,7 @@ def _():
         learning_rate = 1e-3,
         max_iters = 5000,
         epoch_iters = 3, # This overrides max_iters
-        log_iters = 10
+        log_iters = 100
     )
 
     config = cpu_config
