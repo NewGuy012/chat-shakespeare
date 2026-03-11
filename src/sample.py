@@ -8,7 +8,13 @@ with app.setup:
     import pickle
     import tiktoken
     import marimo as mo
+
+    from pathlib import Path, WindowsPath
     from dataclasses import dataclass
+    from train import initialize_model
+    from hyperparameters import determine_device
+
+    torch.set_float32_matmul_precision('high')
 
 
 @app.class_definition
@@ -23,7 +29,30 @@ class SampleConfig:
 
 
 @app.function
-def sample(config, sample_config, model):
+def load_checkpoint(checkpoint_path):
+    device, _ = determine_device()
+
+    torch.serialization.add_safe_globals([WindowsPath])
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    config = checkpoint["config"]
+    model_state_dict = checkpoint["model_state_dict"]
+    optimizer_state_dict = checkpoint["optimizer_state_dict"]
+
+    model, optimizer = initialize_model(config)
+
+    model.load_state_dict(model_state_dict)
+    optimizer.load_state_dict(optimizer_state_dict)
+
+    return config, model, optimizer
+
+
+@app.function
+def sample(sample_config):
+    root_path = Path(__file__).parent.parent
+    checkpoint_path = root_path / "data" / "checkpoint.pt"
+    config, model, _ = load_checkpoint(checkpoint_path)
+
     root_path = config["root_path"]
     device  = config["device"]
     compile = config["compile"]
@@ -37,15 +66,13 @@ def sample(config, sample_config, model):
 
     model.eval()
     model.to(device)
-    if compile:
-        model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
     if load_meta:
         meta_path = root_path / "data" / "meta.pkl"
-        
+
         with open(meta_path, "rb") as f:
             meta = pickle.load(f)
-        
+
         stoi, itos = meta['stoi'], meta['itos']
         encode = lambda s: [stoi[c] for c in s]
         decode = lambda l: ''.join([itos[i] for i in l])

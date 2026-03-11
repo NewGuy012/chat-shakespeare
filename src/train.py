@@ -8,11 +8,12 @@ with app.setup:
     import pickle
     import torch
     import marimo as mo
-    from model import GPTConfig, GPT
     from pathlib import Path
+    from model import GPTConfig, GPT
     from safetensors import safe_open
-
     from torch.utils.data import TensorDataset, DataLoader
+
+    torch.set_float32_matmul_precision('high')
 
 
 @app.function
@@ -174,10 +175,9 @@ def initialize_model(config):
         override_args = dict(dropout=dropout)
         model = GPT.from_pretrained(init_from, override_args)
 
-    # crop down the model block size if desired, using model surgery
-    if block_size < model.config.block_size:
-        model.crop_block_size(block_size)
-        # model_args["block_size"] = block_size # so that the checkpoint will have the right value
+    # # crop down the model block size if desired, using model surgery
+    # if block_size < model.config.block_size:
+    #     model.crop_block_size(block_size)
 
     model.to(device)
 
@@ -200,7 +200,7 @@ def initialize_model(config):
 def train_random_batches(config, model, optimizer):
     max_iters = config["max_iters"]
     lr_decay_iters = config["lr_decay_iters"]
-    eval_interval = config["eval_interval"]
+    log_iters = config["log_iters"]
 
     # training loop
     for iter_num in range(max_iters):
@@ -212,7 +212,7 @@ def train_random_batches(config, model, optimizer):
                 param_group["lr"] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+        if iter_num % log_iters == 0 or iter_num == max_iters - 1:
             losses = estimate_loss(config, model)
             print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["validation"]:.4f}")
 
@@ -231,7 +231,7 @@ def train_sequential_batches(config, model, optimizer):
     max_iters = config["max_iters"]
     epoch_iters = config["epoch_iters"]
     lr_decay_iters = config["lr_decay_iters"]
-    eval_interval = config["eval_interval"]
+    log_iters = config["log_iters"]
     device  = config["device"]
 
     loader, epoch_batches = get_batch_loader(config, "train")
@@ -246,20 +246,20 @@ def train_sequential_batches(config, model, optimizer):
         if iter_num % epoch_batches == 0 and iter_num != 0:
             loader, epoch_batches = get_batch_loader(config, "train")
             loader_iter = iter(loader)
-            
+
         # sample a batch of data
         x, y  = next(loader_iter)
         X, Y = x.to(device), y.to(device)
 
         # evaluate the loss
         logits, loss = model(X, Y)
-        
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
         # clip the gradient
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
+
         optimizer.step()
 
         # determine and set the learning rate for this iteration
@@ -270,7 +270,7 @@ def train_sequential_batches(config, model, optimizer):
                 param_group["lr"] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+        if iter_num % log_iters == 0 or iter_num == max_iters - 1:
             losses = estimate_loss(config, model)
             print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}, norm: {norm:.4f}")
 
@@ -287,10 +287,10 @@ def save_checkpoint(config, model, optimizer, losses):
         checkpoint_dict = {
         "config": config,
         "model_state_dict": model.state_dict(),
-        "optimzer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
         "losses": losses,
         }
-        
+
         torch.save(checkpoint_dict, checkpoint_path)
 
 

@@ -67,7 +67,7 @@ def determine_vocab_size(root_path):
     if meta_path.exists():
         with open(meta_path, "rb") as f:
             meta = pickle.load(f)
-        
+
         vocab_size = meta["vocab_size"]
 
     return vocab_size
@@ -98,7 +98,7 @@ def intialize_hyperparameters(
     bias: bool = False,
     compile: bool = False,
     eval_iters: int = 20,
-    eval_interval: int = 1,
+    log_iters: int = 1,
     device: str = "cpu",
     init_from: str = "scratch"):
 
@@ -127,7 +127,7 @@ def intialize_hyperparameters(
         "bias": bias,
         "compile": compile,
         "eval_iters": eval_iters,
-        "eval_interval": eval_interval,
+        "log_iters": log_iters,
         "device": device,
         "init_from": init_from
     }

@@ -25,10 +25,10 @@ def _():
         n_embd = 64,
         dropout = 0,
         learning_rate = 3e-3,
-        max_iters = 2000,
+        max_iters = 1000,
         epoch_iters = 0, # This overrides max_iters
         beta2 = 0.99,
-        eval_interval = 100
+        log_iters = 100
     )
 
     gpu_config = intialize_hyperparameters(
@@ -41,7 +41,7 @@ def _():
         learning_rate = 1e-3,
         max_iters = 5000,
         epoch_iters = 3, # This overrides max_iters
-        eval_interval = 10
+        log_iters = 10
     )
 
     config = cpu_config
@@ -61,7 +61,7 @@ def _(config):
         ds = download()
         ds_tok = tokenize_char(config, ds)
         save_tensors(config, ds_tok)
-    return
+    return (data_path,)
 
 
 @app.cell
@@ -72,19 +72,23 @@ def _(config):
 
 
 @app.cell
-def _(config, model, optimizer):
+def _(config, data_path, model, optimizer):
     ### Train ###
-    losses, _ = train_sequential_batches(config, model, optimizer)
-    save_checkpoint(config, model, optimizer, losses)
+    checkpoint_path = data_path / "checkpoint.pt"
+
+    if not checkpoint_path.exists():
+        losses, _ = train_sequential_batches(config, model, optimizer)
+        save_checkpoint(config, model, optimizer, losses)
     return
 
 
 @app.cell
-def _(config, model):
-    ### Sample ###
-    sample_config = SampleConfig(load_meta = True)
-    sample_config
-    sample(config, sample_config, model)
+def _():
+    # ### Sample ###
+    # sample_config = SampleConfig(load_meta = True)
+    # sample_config
+
+    # sample(config, sample_config)
     return
 
 

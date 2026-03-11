@@ -18,16 +18,14 @@ A sandbox to explore concepts in LLM and PyTorch.
 
 ### Executing program
 
-0. Set up dependencies
+1. Setup using setup.sh
 ```
-git clone
+sudo ldconfig
+git clone https://github.com/NewGuy012/chat-shakespeare.git
+cd chat-shakespeare/
 uv sync
-```
-
-1. Run the main.py program
-```
-uv run main.py OR
-marimo edit main.py
+source .venv/bin/activate
+marimo edit
 ```
 
 2. Adjust hyperparameters depending on hardware
@@ -62,7 +60,7 @@ beta2 = 0.99
 warmup_iters = 100
 ```
 
-3. For using GPU compute on cloud, I'd recommend Thunder Compute
+3. For using GPU compute on cloud, I am currently using Thunder Compute.
 
 ## Authors
 
@@ -82,10 +80,6 @@ This project is licensed under the BSD 2-Clause license. See the LICENSE.md file
 This project were inspired by the Andrej Karpathy's Zero to Hero YouTube playlist as well as his nanoGPT repo.
 
 ## To Do
-* huggingface accelerate
+* huggingface accelerate vs pytorch lightning
 * change dataset to wiki
 * fine-tune to conversational
-* add support to thunder compute
-* add sequential data loader
-* add support for running inference on pre-trained models
-* update readme in github

@@ -13,8 +13,6 @@ with app.setup:
     import torch.nn as nn
     from torch.nn import functional as F
 
-    torch.set_float32_matmul_precision('high')
-
 
 @app.class_definition
 class LayerNorm(nn.Module):
