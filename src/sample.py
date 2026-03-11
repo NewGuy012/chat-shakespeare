@@ -25,6 +25,7 @@ class SampleConfig:
     max_new_tokens: int = 500 # number of tokens generated in each sample
     temperature: float = 0.95 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
     top_k: int = 200
+    bOverwrite: bool = False
 
 
 @app.function
@@ -47,12 +48,11 @@ def load_checkpoint(checkpoint_path):
 
 
 @app.function
-def sample(sample_config):
-    root_path = Path(__file__).parent.parent
-    checkpoint_path = root_path / "data" / "checkpoint.pt"
+def sample(config, sample_config):
+    checkpoint_path = config["checkpoint_path"]
     config, model, _ = load_checkpoint(checkpoint_path)
 
-    root_path = config["root_path"]
+    meta_path = config["meta_path"]
     device  = config["device"]
     compile = config["compile"]
 
@@ -65,17 +65,18 @@ def sample(sample_config):
     model.eval()
     model.to(device)
 
-    meta_path = root_path / "data" / "meta.pkl"
-
     if meta_path.exists():
         with open(meta_path, "rb") as f:
             meta = pickle.load(f)
+
+        encode = meta['encode']
+        decode = meta['decode']
 
         stoi, itos = meta['stoi'], meta['itos']
         encode = lambda s: [stoi[c] for c in s]
         decode = lambda l: ''.join([itos[i] for i in l])
     else:
-        # ok let's assume gpt-2 encodings by default
+        # gpt-2 encodings by default
         enc = tiktoken.get_encoding("gpt2")
         encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
         decode = lambda l: enc.decode(l)

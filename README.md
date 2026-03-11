@@ -5,20 +5,20 @@ A sandbox to explore concepts in LLM and PyTorch.
 
 ## Description
 
-- Built from the ground up from the classic LLM transformer paper that started it all: Attention is All You Need.
+- Build from the ground up from the classic LLM transformer architecture based on paper that started it all: Attention is All You Need.
 - Trained on the tinyshakespeare dataset.
 
 ## Getting Started
 
 ### Main Dependencies
 
-* marimo
-* torch (PyTorch)
-* transformers (Hugging Face)
+* marimo (to explore data)
+* torch (for setting up neural networks)
+* transformers (for downloading datasets)
 
 ### Executing program
 
-1. Setup using setup.sh
+1. Setup in linux instance running setup.sh
 ```
 sudo ldconfig
 git clone https://github.com/NewGuy012/chat-shakespeare.git
@@ -60,7 +60,7 @@ beta2 = 0.99
 warmup_iters = 100
 ```
 
-3. For using GPU compute on cloud, I am currently using Thunder Compute.
+3. Run main.py. For using GPU compute on cloud, I am currently using Thunder Compute.
 
 ## Authors
 
@@ -81,5 +81,5 @@ This project were inspired by the Andrej Karpathy's Zero to Hero YouTube playlis
 
 ## To Do
 * huggingface accelerate vs pytorch lightning
-* change dataset to wiki
+* change dataset to wiki or tinystories
 * fine-tune to conversational

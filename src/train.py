@@ -21,10 +21,10 @@ def get_batch_loader(config, split):
     batch_size = config["batch_size"]
     block_size = config["block_size"]
     device  = config["device"]
+    data_path = config["data_path"]
 
     file_name = f"{split}.safetensors"
-    root_file = Path(__file__).parent.parent
-    file_path = root_file / "data" / file_name
+    file_path = data_path / file_name
 
     with safe_open(file_path, framework="pt", device=device) as f:
             # Access tensors by name
@@ -50,10 +50,10 @@ def get_batch_slice(config, split):
     batch_size = config["batch_size"]
     block_size = config["block_size"]
     device  = config["device"]
-
+    data_path = config["data_path"]
+    
     file_name = f"{split}.safetensors"
-    root_file = Path(__file__).parent.parent
-    file_path = root_file / "data" / file_name
+    file_path = data_path / file_name
 
     with safe_open(file_path, framework="pt", device=device) as f:
         tensor_slice = f.get_slice(split)
@@ -72,10 +72,10 @@ def get_batch_random(config, split):
     block_size = config["block_size"]
     batch_size = config["batch_size"]
     device  = config["device"]
+    data_path = config["data_path"]
 
     file_name = f"{split}.safetensors"
-    root_file = Path(__file__).parent.parent
-    file_path = root_file / "data" / file_name
+    file_path = data_path /  file_name
 
     with safe_open(file_path, framework="pt", device=device) as f:
         # Access tensors by name
@@ -136,7 +136,7 @@ def get_lr(config, it):
 
 @app.function
 def initialize_model(config):
-    root_path = config["root_path"]
+    meta_path = config["meta_path"]
     vocab_size = config["vocab_size"]
     block_size = config["block_size"]
     n_layer = config["n_layer"]
@@ -152,8 +152,6 @@ def initialize_model(config):
     compile = config["compile"]
     init_from = config["init_from"]
 
-    meta_path = root_path / "data" / "meta.pkl"
-
     print("\nInitializing model:")
 
     if meta_path.exists():
@@ -164,7 +162,7 @@ def initialize_model(config):
         print(f"\tLoading vocab size from meta file as {vocab_size}.\n")
 
     if init_from == 'scratch':
-       
+
         model_args = dict(
             vocab_size=vocab_size,
             block_size=block_size,
@@ -198,7 +196,7 @@ def initialize_model(config):
 
     # compile the model
     if compile:
-        print("\tCompiling the model... (takes a ~minute)")
+        print("\tCompiling the model...")
         model = torch.compile(model) # requires PyTorch 2.0
 
     return model, optimizer
@@ -247,7 +245,7 @@ def train_sequential_batches(config, model, optimizer):
 
     print("\nTraining model:")
     print(f"\t1 epoch = {epoch_batches} batches")
-    
+
     if epoch_iters != 0:
         max_iters = epoch_batches * epoch_iters
         print(f"\tIterating for {epoch_iters} epoch(es) or {max_iters} iterations.")
@@ -290,19 +288,17 @@ def train_sequential_batches(config, model, optimizer):
 
 @app.function
 def save_checkpoint(config, model, optimizer, losses):
-    root_path = config["root_path"]
-    checkpoint_path = root_path / "data" / "checkpoint.pt"
+    checkpoint_path = config["checkpoint_path"]
+    
+    # Save model to checkpoint
+    checkpoint_dict = {
+        "config": config,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "losses": losses,
+    }
 
-    if not checkpoint_path.exists():
-        # Save model to checkpoint
-        checkpoint_dict = {
-            "config": config,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "losses": losses,
-        }
-
-        torch.save(checkpoint_dict, checkpoint_path)
+    torch.save(checkpoint_dict, checkpoint_path)
 
 
 if __name__ == "__main__":

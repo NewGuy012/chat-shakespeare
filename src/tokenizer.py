@@ -13,22 +13,29 @@ with app.setup:
     from transformers import AutoTokenizer
     from torch.utils.data import DataLoader
     from safetensors.torch import save_file
-    from datasets import DatasetDict, load_dataset
+    from datasets import DatasetDict, load_dataset, load_from_disk
+
+    enc = tiktoken.get_encoding("gpt2")
 
 
 @app.function
-def download():
-    # jchwenger/tiny_shakespeare 
-    dataset = load_dataset("Trelis/tiny-shakespeare")
-    dataset = dataset.rename_column("Text", "text")
+def download(config):
+    download_path = config["download_path"]
+    
+    if download_path.exists():
+        dataset = load_from_disk(download_path)
+    else:
+        # jchwenger/tiny_shakespeare 
+        dataset = load_dataset("Trelis/tiny-shakespeare")
+        dataset = dataset.rename_column("Text", "text")
+    
+        dataset.save_to_disk(download_path)
 
     return dataset
 
 
 @app.function
-def tokenize(ds):
-    enc = tiktoken.get_encoding("gpt2")
-
+def tokenize_gpt2(config, ds):
     # Load the standard Python tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
@@ -44,20 +51,35 @@ def tokenize(ds):
 
         return token_dict
 
-     # Batch tokenize
+    # Batch tokenize
     tokenized = ds.map(
         tokenization,
         remove_columns=['text'],
         desc="HF tokenizer",
         batched=True)
 
+    meta = {
+        'vocab_size': config["vocab_size"],
+        'encode': encode_gpt2,
+        'decode': decode_gpt2,
+    }
+    save_meta(config, meta)
+
     return tokenized
 
 
 @app.function
-def tokenize_tiktoken(ds):
-    enc = tiktoken.get_encoding("gpt2")
+def encode_gpt2(s):
+    return enc.encode(s, allowed_special={"<|endoftext|>"})
 
+
+@app.function
+def decode_gpt2(l):
+    return enc.decode(l)
+
+
+@app.function
+def tokenize_tiktoken(config, ds):
     def process(ds):
         ids = enc.encode_ordinary(ds['text']) # encode_ordinary ignores any special tokens
         ids.append(enc.eot_token)
@@ -71,13 +93,20 @@ def tokenize_tiktoken(ds):
         desc="Tokenizing the splits"
     )
 
+    meta = {
+        'vocab_size': config["vocab_size"],
+        'encode': encode_gpt2,
+        'decode': decode_gpt2,
+    }
+    save_meta(config, meta)
+
     return tokenized
 
 
 @app.function
 def tokenize_char(config, ds):
-    root_path = config["root_path"]
-    tensor_path = root_path / "data" / "train.safetensors"
+    data_path = config["data_path"]
+    tensor_path = data_path / "train.safetensors"
 
     ds_train = ds["train"]["text"]
     ds_val = ds["test"]["text"]
@@ -95,12 +124,12 @@ def tokenize_char(config, ds):
     print(f"\tVocab size: {vocab_size:,}")
 
     # create a mapping from characters to integers
-    stoi_dict = { ch:i for i,ch in enumerate(chars) }
-    itos_dict = { i:ch for i,ch in enumerate(chars) }
+    stoi = { ch:i for i,ch in enumerate(chars) }
+    itos = { i:ch for i,ch in enumerate(chars) }
 
     # encode both to integers
-    ds_train = encode_char(stoi_dict, ds_train)
-    ds_val = encode_char(stoi_dict, ds_val)
+    ds_train = encode_char(ds_train, stoi)
+    ds_val = encode_char(ds_val, stoi)
 
     ds = {
         "train": {"input_ids": ds_train},
@@ -109,8 +138,10 @@ def tokenize_char(config, ds):
 
     meta = {
         'vocab_size': vocab_size,
-        'itos': itos_dict,
-        'stoi': stoi_dict,
+        'encode': encode_char,
+        'decode': decode_char,
+        'stoi': stoi,
+        'itos': itos
     }
     save_meta(config, meta)
 
@@ -118,22 +149,20 @@ def tokenize_char(config, ds):
 
 
 @app.function
-def encode_char(stoi_dict, s):
-    # encoder: take a string, output a list of integers
-    return [stoi_dict[c] for c in s]
+def encode_char(s, stoi):
+    return [stoi[c] for c in s]
 
 
 @app.function
-def decode_char(itos_dict, l):
-    # decoder: take a list of integers, output a string
-    return ''.join([itos_dict[i] for i in l])
+def decode_char(l, itos):
+    return ''.join([itos[i] for i in l])
 
 
 @app.function
 def save_meta(config, meta):
-    root_path = config["root_path"]
+    data_path = config["data_path"]
 
-    save_path = root_path / "data" / "meta.pkl"
+    save_path = data_path / "meta.pkl"
 
     with open(save_path, 'wb') as f:
         pickle.dump(meta, f)
@@ -141,9 +170,9 @@ def save_meta(config, meta):
 
 @app.function
 def save_tensors(config, ds):
-    root_path = config["root_path"]
-    train_path = root_path / "data" / "train.safetensors"
-    val_path = root_path / "data" / "val.safetensors"
+    data_path = config["data_path"]
+    train_path = data_path / "train.safetensors"
+    val_path = data_path / "val.safetensors"
 
     if isinstance(ds, DatasetDict):
         ds.set_format(type='torch', columns=['input_ids'])

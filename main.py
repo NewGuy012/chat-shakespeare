@@ -8,8 +8,8 @@ with app.setup:
     import marimo as mo
     from pathlib import Path
 
-    from tokenizer import download, tokenize, tokenize_char, save_tensors
     from hyperparameters import intialize_hyperparameters
+    from tokenizer import download, tokenize_gpt2, tokenize_char, save_tensors
     from train import initialize_model, train_sequential_batches, save_checkpoint
     from sample import SampleConfig, sample
 
@@ -25,7 +25,7 @@ def _():
         n_embd = 64,
         dropout = 0,
         learning_rate = 3e-3,
-        max_iters = 1000,
+        max_iters = 200,
         epoch_iters = 0, # This overrides max_iters
         beta2 = 0.99,
         log_iters = 100
@@ -39,8 +39,8 @@ def _():
         n_embd = 384,
         dropout = 0.1,
         learning_rate = 1e-3,
-        max_iters = 5000,
-        epoch_iters = 3, # This overrides max_iters
+        max_iters = 2000,
+        epoch_iters = 0, # This overrides max_iters
         log_iters = 100
     )
 
@@ -52,37 +52,51 @@ def _():
 @app.cell
 def _(config):
     ### Tokenize ###
-    data_path = config["root_path"] / "data"
-    tensor_path = data_path / "train.safetensors"
+    bOverwrite = True
+    tokenize(config, bOverwrite)
 
-    data_path.mkdir(parents=True, exist_ok=True)
-
-    if not tensor_path.exists():
-        ds = download()
-        ds_tok = tokenize_char(config, ds)
-        save_tensors(config, ds_tok)
-
-    ### Pre-Training ###
-    checkpoint_path = data_path / "checkpoint.pt"
-
-    if not checkpoint_path.exists():
-        ### Initialize Model ###
-        model, optimizer = initialize_model(config)
-
-        ### Train Model ###
-        losses, _ = train_sequential_batches(config, model, optimizer)
-        save_checkpoint(config, model, optimizer, losses)
-    return
+    ### Training ###
+    bOverwrite = True
+    training(config, bOverwrite)
+    return (bOverwrite,)
 
 
 @app.cell
-def _():
+def _(bOverwrite, config):
     ### Sample ###
-    sample_config = SampleConfig()
+    sample_config = SampleConfig(
+        bOverwrite = bOverwrite,
+        num_samples = 1,
+        max_new_tokens = 500
+    )
     sample_config
 
-    sample(sample_config)
+    sample(config, sample_config)
     return
+
+
+@app.function
+def tokenize(config, bOverwrite):
+    ds = download(config)
+
+    tensor_path = config["tensor_path"]
+
+    if bOverwrite or not tensor_path.exists():
+        ds_tok = tokenize_char(config, ds)
+        save_tensors(config, ds_tok)
+
+
+@app.function
+def training(config, bOverwrite):
+    checkpoint_path = config["checkpoint_path"]
+
+    if bOverwrite or not checkpoint_path.exists():
+        # Initialize
+        model, optimizer = initialize_model(config)
+
+        # Train
+        losses, _ = train_sequential_batches(config, model, optimizer)
+        save_checkpoint(config, model, optimizer, losses)
 
 
 if __name__ == "__main__":

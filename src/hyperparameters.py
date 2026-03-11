@@ -13,6 +13,11 @@ with app.setup:
     from pathlib import Path
     from rich.pretty import pprint
 
+    root_path = Path(__file__).parent.parent
+    data_path = root_path / "data"
+
+    data_path.mkdir(parents=True, exist_ok=True)
+
 
 @app.cell
 def _():
@@ -60,8 +65,7 @@ def determine_device():
 
 
 @app.function
-def determine_vocab_size(root_path):
-    meta_path = root_path / "data" / "meta.pkl"
+def determine_vocab_size(meta_path):
     vocab_size = 50304
 
     if meta_path.exists():
@@ -78,7 +82,12 @@ def determine_vocab_size(root_path):
 
 # @app.command()
 def intialize_hyperparameters(
-    root_path: str = Path(__file__).parent.parent,
+    root_path: str = root_path,
+    data_path: str = data_path,
+    meta_path: str = data_path / "meta.pkl",
+    tensor_path: str = data_path / "train.safetensors",
+    checkpoint_path: str = data_path / "checkpoint.pt",
+    download_path: str = data_path / "download",
     batch_size: int = 4,
     block_size: int = 8,
     vocab_size = 50304,
@@ -104,10 +113,15 @@ def intialize_hyperparameters(
 
     device, compile = determine_device()
 
-    vocab_size = determine_vocab_size(root_path)
+    vocab_size = determine_vocab_size(meta_path)
 
     config_dict = {
         "root_path": root_path,
+        "data_path": data_path,
+        "meta_path": meta_path,
+        "tensor_path": tensor_path,
+        "checkpoint_path": checkpoint_path,
+        "download_path": download_path,
         "batch_size": batch_size,
         "block_size": block_size,
         "vocab_size": vocab_size,
