@@ -34,7 +34,6 @@ def get_batch_loader(config, split):
     quotient = (data_length // block_size)-1
     truncate_length = block_size * quotient
     epoch_batches = data_length // (batch_size * block_size)
-    print(f"1 epoch = {epoch_batches} batches")
 
     x = data[:truncate_length].view(-1, block_size)
     y = data[1:truncate_length+1].view(-1, block_size)
@@ -137,6 +136,7 @@ def get_lr(config, it):
 
 @app.function
 def initialize_model(config):
+    root_path = config["root_path"]
     vocab_size = config["vocab_size"]
     block_size = config["block_size"]
     n_layer = config["n_layer"]
@@ -152,11 +152,19 @@ def initialize_model(config):
     compile = config["compile"]
     init_from = config["init_from"]
 
-    if init_from == 'scratch':
-        # Initialize model
-        print("Initializing a new model from scratch")
-        print(f"defaulting to vocab_size of GPT-2 to {vocab_size}")
+    meta_path = root_path / "data" / "meta.pkl"
 
+    print("\nInitializing model:")
+
+    if meta_path.exists():
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+
+        vocab_size = meta["vocab_size"]
+        print(f"\tLoading vocab size from meta file as {vocab_size}.\n")
+
+    if init_from == 'scratch':
+       
         model_args = dict(
             vocab_size=vocab_size,
             block_size=block_size,
@@ -170,7 +178,7 @@ def initialize_model(config):
 
     elif init_from.startswith('gpt2'):
         # initialize from OpenAI GPT-2 weights
-        print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+        print(f"\tLoading weights from GPT-2...")
 
         override_args = dict(dropout=dropout)
         model = GPT.from_pretrained(init_from, override_args)
@@ -190,7 +198,7 @@ def initialize_model(config):
 
     # compile the model
     if compile:
-        print("compiling the model... (takes a ~minute)")
+        print("\tCompiling the model... (takes a ~minute)")
         model = torch.compile(model) # requires PyTorch 2.0
 
     return model, optimizer
@@ -214,7 +222,7 @@ def train_random_batches(config, model, optimizer):
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % log_iters == 0 or iter_num == max_iters - 1:
             losses = estimate_loss(config, model)
-            print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["validation"]:.4f}")
+            print(f"\tStep {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["validation"]:.4f}")
 
         # sample a batch of data
         X, Y = get_batch_random(config, "train")
@@ -237,9 +245,12 @@ def train_sequential_batches(config, model, optimizer):
     loader, epoch_batches = get_batch_loader(config, "train")
     loader_iter = iter(loader)
 
+    print("\nTraining model:")
+    print(f"\t1 epoch = {epoch_batches} batches")
+    
     if epoch_iters != 0:
         max_iters = epoch_batches * epoch_iters
-        print(f"Iterating for {epoch_iters} epoch(es) or {max_iters} iterations")
+        print(f"\tIterating for {epoch_iters} epoch(es) or {max_iters} iterations.")
 
     # training loop
     for iter_num in range(max_iters):
@@ -272,7 +283,7 @@ def train_sequential_batches(config, model, optimizer):
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % log_iters == 0 or iter_num == max_iters - 1:
             losses = estimate_loss(config, model)
-            print(f"step {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}, norm: {norm:.4f}")
+            print(f"\tStep {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}, norm: {norm:.4f}")
 
     return losses, norm
 
@@ -285,10 +296,10 @@ def save_checkpoint(config, model, optimizer, losses):
     if not checkpoint_path.exists():
         # Save model to checkpoint
         checkpoint_dict = {
-        "config": config,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "losses": losses,
+            "config": config,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "losses": losses,
         }
 
         torch.save(checkpoint_dict, checkpoint_path)

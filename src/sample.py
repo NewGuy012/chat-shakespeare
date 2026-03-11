@@ -20,7 +20,6 @@ with app.setup:
 @app.class_definition
 @dataclass
 class SampleConfig:
-    load_meta: bool = False
     start: str = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
     num_samples: int = 1 # number of samples to draw
     max_new_tokens: int = 500 # number of tokens generated in each sample
@@ -57,7 +56,6 @@ def sample(sample_config):
     device  = config["device"]
     compile = config["compile"]
 
-    load_meta = sample_config.load_meta
     start = sample_config.start
     num_samples = sample_config.num_samples
     max_new_tokens = sample_config.max_new_tokens
@@ -67,9 +65,9 @@ def sample(sample_config):
     model.eval()
     model.to(device)
 
-    if load_meta:
-        meta_path = root_path / "data" / "meta.pkl"
+    meta_path = root_path / "data" / "meta.pkl"
 
+    if meta_path.exists():
         with open(meta_path, "rb") as f:
             meta = pickle.load(f)
 

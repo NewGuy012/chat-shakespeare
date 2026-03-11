@@ -89,9 +89,12 @@ def tokenize_char(config, ds):
     # get all the unique characters that occur in this text
     chars = sorted(list(set(data)))
     vocab_size = len(chars)
-    print("all the unique characters:", ''.join(chars))
-    print(f"vocab size: {vocab_size:,}")
-
+    unique_chars = ''.join(chars)
+    
+    print("\nTokenize text:")
+    print(f"\tVocab size: {vocab_size:,}")
+    print(f"\tAll the unique characters: {unique_chars}" )
+    
     # create a mapping from characters to integers
     stoi_dict = { ch:i for i,ch in enumerate(chars) }
     itos_dict = { i:ch for i,ch in enumerate(chars) }

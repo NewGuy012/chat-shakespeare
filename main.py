@@ -16,7 +16,7 @@ with app.setup:
 
 @app.cell
 def _():
-    ### Hyperpameters ###
+    ### Set Hyperpameters ###
     cpu_config = intialize_hyperparameters(
         batch_size = 8,
         block_size = 64,
@@ -61,22 +61,15 @@ def _(config):
         ds = download()
         ds_tok = tokenize_char(config, ds)
         save_tensors(config, ds_tok)
-    return (data_path,)
 
-
-@app.cell
-def _(config):
-    ### Model ###
-    model, optimizer = initialize_model(config)
-    return model, optimizer
-
-
-@app.cell
-def _(config, data_path, model, optimizer):
-    ### Train ###
+    ### Pre-Training ###
     checkpoint_path = data_path / "checkpoint.pt"
 
     if not checkpoint_path.exists():
+        ### Initialize Model ###
+        model, optimizer = initialize_model(config)
+
+        ### Train Model ###
         losses, _ = train_sequential_batches(config, model, optimizer)
         save_checkpoint(config, model, optimizer, losses)
     return
@@ -84,11 +77,11 @@ def _(config, data_path, model, optimizer):
 
 @app.cell
 def _():
-    # ### Sample ###
-    # sample_config = SampleConfig(load_meta = True)
-    # sample_config
+    ### Sample ###
+    sample_config = SampleConfig()
+    sample_config
 
-    # sample(config, sample_config)
+    sample(sample_config)
     return
 
 
