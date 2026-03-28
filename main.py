@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.20.4"
+__generated_with = "0.21.1"
 app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
@@ -18,17 +18,17 @@ with app.setup:
 def _():
     ### Set Hyperpameters ###
     cpu_config = intialize_hyperparameters(
-        batch_size = 8,
-        block_size = 64,
+        batch_size = 32,
+        block_size = 256,
         n_layer = 4,
         n_head = 4,
-        n_embd = 64,
+        n_embd = 256,
         dropout = 0,
-        learning_rate = 3e-3,
-        max_iters = 200,
+        learning_rate = 2e-3,
+        max_iters = 5000,
         epoch_iters = 0, # This overrides max_iters
         beta2 = 0.99,
-        log_iters = 100
+        log_iters = 500
     )
 
     gpu_config = intialize_hyperparameters(
