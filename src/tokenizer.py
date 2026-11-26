@@ -269,13 +269,9 @@ def load_tokenizer(
 
             return len(chars), encode_char, decode_char
 
-        vocab_size = int(meta.get("vocab_size", _DEFAULT_GPT2_VOCAB_SIZE))
-    else:
-        vocab_size = _DEFAULT_GPT2_VOCAB_SIZE
-
     enc = _gpt2_encoding()
 
     def encode_gpt2(text: str) -> list[int]:
         return enc.encode(text, allowed_special={_EOT_TOKEN})
 
-    return vocab_size, encode_gpt2, enc.decode
+    return enc.n_vocab, encode_gpt2, enc.decode

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -27,9 +28,11 @@ from tokenizer import (
     tokens_ready,
 )
 from train import (
+    build_accelerator,
     checkpoint_ready,
     ensure_checkpoint,
     get_lr,
+    initialize_model,
     load_checkpoint,
     save_checkpoint,
     train,
@@ -645,9 +648,246 @@ class PipelineTests(unittest.TestCase):
             ):
                 train_main()
                 called_cfg = mock_ensure.call_args.args[0]
+                self.assertEqual(called_cfg.arch, "gpt2")
                 self.assertEqual(called_cfg.tokenizer, "gpt2")
                 self.assertEqual(called_cfg.vocab_size, 50304)
                 self.assertTrue((Path(tmp) / "tokens" / "gpt2" / "meta.json").is_file())
+
+    def test_vocab_padding_and_batched_masked_sampling(self) -> None:
+        ds = {
+            "train": {
+                "text": [
+                    "First Citizen:\nBefore we proceed any further, hear me speak.\n"
+                    * 8
+                ]
+            },
+            "test": {"text": ["All:\nSpeak, speak.\n" * 6]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = TrainConfig.auto(
+                "cpu",
+                data_path=Path(tmp),
+                tokenizer="char",
+                block_size=8,
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                n_layer=1,
+                n_head=2,
+                n_embd=16,
+                max_iters=2,
+                warmup_iters=1,
+                log_iters=1,
+                eval_iters=1,
+            )
+            save_tensors(cfg, tokenize_char(cfg, ds))
+            raw_vocab, _, _ = load_tokenizer(cfg.meta_path)
+            self.assertEqual(raw_vocab, 30)
+
+            model, _ = initialize_model(cfg)
+            self.assertEqual(model.config.vocab_size, 64)
+            self.assertEqual(cfg.vocab_size, 64)
+
+            # Heavily bias padded token rows to verify logit masking prevents invalid token IDs.
+            with torch.no_grad():
+                model.transformer.wte.weight[raw_vocab:].fill_(50.0)
+
+            texts = sample(
+                cfg,
+                SampleConfig(
+                    start="First",
+                    num_samples=3,
+                    max_new_tokens=6,
+                    temperature=0.5,
+                    top_k=5,
+                ),
+                model=model,
+            )
+            self.assertEqual(len(texts), 3)
+            for t in texts:
+                self.assertTrue(t.startswith("First"))
+                self.assertEqual(len(t), len("First") + 6)
+
+            gpt2_tok_vocab, _, _ = load_tokenizer(None)
+            self.assertEqual(gpt2_tok_vocab, 50257)
+
+    def test_legacy_gpt2_checkpoint_auto_detection_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt_dir = Path(tmp) / "legacy_gpt2"
+            ckpt_dir.mkdir()
+            gpt2_model = GPT(
+                GPTConfig(
+                    block_size=8,
+                    vocab_size=64,
+                    n_layer=1,
+                    n_head=2,
+                    n_embd=8,
+                    bias=False,
+                    arch="gpt2",
+                )
+            )
+            save_model(gpt2_model, str(ckpt_dir / "model.safetensors"))
+            # Save config.json omitting "arch" (pre-modern checkpoint layout).
+            legacy_cfg = {
+                "data_path": tmp,
+                "block_size": 8,
+                "vocab_size": 64,
+                "n_layer": 1,
+                "n_head": 2,
+                "n_embd": 8,
+                "bias": False,
+                "init_from": "scratch",
+                "tokenizer": "char",
+            }
+            (ckpt_dir / "config.json").write_text(
+                json.dumps(legacy_cfg), encoding="utf-8"
+            )
+
+            loaded_cfg, loaded_model = load_checkpoint(ckpt_dir, device="cpu")
+            self.assertEqual(loaded_cfg.arch, "gpt2")
+            self.assertEqual(loaded_model.config.arch, "gpt2")
+
+            # Even if config.json claims arch="modern", wpe.weight in safetensors switches it to gpt2.
+            legacy_cfg["arch"] = "modern"
+            (ckpt_dir / "config.json").write_text(
+                json.dumps(legacy_cfg), encoding="utf-8"
+            )
+            auto_cfg = TrainConfig.auto(
+                "cpu", data_path=Path(tmp), init_from=str(ckpt_dir)
+            )
+            self.assertEqual(auto_cfg.arch, "gpt2")
+            init_model, _ = initialize_model(auto_cfg)
+            self.assertEqual(init_model.config.arch, "gpt2")
+            self.assertEqual(auto_cfg.arch, "gpt2")
+
+    def test_early_stopping_and_cli_overrides(self) -> None:
+        ds = {
+            "train": {
+                "text": [
+                    "First Citizen:\nBefore we proceed any further, hear me speak.\n"
+                    * 16
+                ]
+            },
+            "test": {"text": ["All:\nSpeak, speak.\n" * 20]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = TrainConfig.auto(
+                "cpu",
+                data_path=Path(tmp),
+                block_size=8,
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                n_layer=1,
+                n_head=2,
+                n_embd=16,
+                max_iters=10,
+                warmup_iters=1,
+                log_iters=2,
+                eval_iters=1,
+                early_stopping_patience=1,
+            )
+            save_tensors(cfg, tokenize_bpe(cfg, ds))
+            eval_seq = iter(
+                [
+                    {"train": 5.0, "val": 5.0},
+                    {"train": 4.5, "val": 4.0},
+                    {"train": 4.2, "val": 4.3},
+                ]
+            )
+            with patch(
+                "train.estimate_loss", side_effect=lambda *a, **k: next(eval_seq)
+            ):
+                acc = Accelerator(cpu=True, mixed_precision="no")
+                _, _, losses = train(cfg, accelerator=acc)
+            self.assertEqual(losses["val"], 4.0)
+
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            cuda_cfg = TrainConfig.auto("cuda", data_path=Path(tmp))
+            cuda_acc = build_accelerator(cuda_cfg)
+            assert cuda_acc.state.dynamo_plugin is not None
+            self.assertEqual(cuda_acc.state.dynamo_plugin.mode, "reduce-overhead")
+
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            cli_argv = [
+                "src/train.py",
+                "--device",
+                "cpu",
+                "--arch",
+                "gpt2",
+                "--batch-size",
+                "4",
+                "--grad-accum",
+                "1",
+                "--block-size",
+                "32",
+                "--lr",
+                "5e-4",
+                "--no-compile",
+                "--early-stopping",
+                "2",
+                "--data-path",
+                tmp,
+                "--max-iters",
+                "2",
+            ]
+            with (
+                patch.object(sys, "argv", cli_argv),
+                patch("tokenizer.download", return_value=ds),
+                patch("train.ensure_checkpoint") as mock_ensure,
+            ):
+                train_main()
+                called_cfg = mock_ensure.call_args.args[0]
+                self.assertEqual(called_cfg.arch, "gpt2")
+                self.assertEqual(called_cfg.batch_size, 4)
+                self.assertEqual(called_cfg.gradient_accumulation_steps, 1)
+                self.assertEqual(called_cfg.block_size, 32)
+                self.assertAlmostEqual(called_cfg.learning_rate, 5e-4)
+                self.assertAlmostEqual(called_cfg.min_lr, 5e-5)
+                self.assertFalse(called_cfg.compile)
+                self.assertEqual(called_cfg.early_stopping_patience, 2)
+
+    @unittest.skipUnless(
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available(),
+        "MPS device not available",
+    )
+    def test_mps_bf16_modern_e2e(self) -> None:
+        ds = {
+            "train": {
+                "text": [
+                    "First Citizen:\nBefore we proceed any further, hear me speak.\n"
+                    * 16
+                ]
+            },
+            "test": {"text": ["All:\nSpeak, speak.\n" * 20]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = TrainConfig.auto(
+                "mps",
+                data_path=Path(tmp),
+                block_size=16,
+                batch_size=4,
+                gradient_accumulation_steps=1,
+                n_layer=1,
+                n_head=2,
+                n_embd=32,
+                max_iters=3,
+                warmup_iters=1,
+                log_iters=2,
+                eval_iters=1,
+            )
+            save_tensors(cfg, tokenize_bpe(cfg, ds))
+            acc, trained_model, losses = train(cfg)
+            self.assertIn("val", losses)
+            ckpt_dir = save_checkpoint(cfg, acc, trained_model, losses)
+            self.assertTrue((ckpt_dir / "model.safetensors").exists())
+            texts = sample(
+                cfg,
+                SampleConfig(start="First", num_samples=2, max_new_tokens=8, top_k=5),
+            )
+            self.assertEqual(len(texts), 2)
+            for t in texts:
+                self.assertTrue(t.startswith("First"))
 
 
 if __name__ == "__main__":
