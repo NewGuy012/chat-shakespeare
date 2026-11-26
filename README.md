@@ -1,6 +1,19 @@
-# Chat Shakespeare
+<h1 align="center">
+  <img src="docs/logo.png" alt="Chat Shakespeare logo" width="44" valign="middle" />&nbsp; Chat Shakespeare
+</h1>
 
-A minimal GPT implementation in PyTorch with Hugging Face Accelerate, `safetensors` checkpoints, and a [marimo](https://marimo.io) workflow.
+<p align="center">
+  A minimal GPT implementation in PyTorch with Hugging Face Accelerate, <code>safetensors</code> checkpoints, and a <a href="https://marimo.io">marimo</a> workflow.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-%3E%3D3.14-3776AB?logo=python&logoColor=white" alt="Python >=3.14" />
+  <img src="https://img.shields.io/badge/PyTorch-%3E%3D2.15-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch >=2.15" />
+  <img src="https://img.shields.io/badge/Accelerate-%3E%3D1.16-FFD21E?logo=huggingface&logoColor=000" alt="Accelerate >=1.16" />
+  <img src="https://img.shields.io/badge/safetensors-%3E%3D0.8-0EA5E9" alt="safetensors >=0.8" />
+  <img src="https://img.shields.io/badge/marimo-%3E%3D0.26-1C7D78" alt="marimo >=0.26" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--2--Clause-2563EB" alt="BSD-2-Clause License" /></a>
+</p>
 
 - **From-scratch GPT**: Causal self-attention via `F.scaled_dot_product_attention`, fused `AdamW`, and optional pretrained GPT-2 loading directly from Hugging Face `safetensors` (no `transformers` or `pickle`).
 - **Hardware-aware training**: [`TrainConfig.auto()`](src/hyperparameters.py) tunes model size, batching, and precision automatically for CPU (`fp32`), Apple Silicon MPS (`bf16`), and CUDA (`bf16`/`fp16` + `torch.compile`).
@@ -35,6 +48,14 @@ Run tests:
 ```bash
 uv run python -m unittest discover -s tests
 ```
+
+## Screenshots
+
+### Interactive marimo notebook (`main.py`)
+![marimo notebook training and sample output](docs/marimo-notebook.png)
+
+### CLI training & sampling on Apple Silicon (`mps`, `bf16`)
+![CLI training and sample output](docs/cli-sample.png)
 
 ## Hardware Presets
 
