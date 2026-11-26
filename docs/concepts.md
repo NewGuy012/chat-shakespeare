@@ -151,21 +151,22 @@ Because Tiny Shakespeare's tokenized splits are only a few megabytes, [`TokenBat
 
 > **Code:** [`src/model.py`](../src/model.py)
 
-From-scratch training defaults to **`arch="modern"`**, which keeps the classic Transformer block layout while swapping in modern LLM upgrades that train faster and converge cleanly; whenever you load pretrained OpenAI GPT-2 weights (`--init-from gpt2`) or a saved GPT-2 checkpoint, Chat Shakespeare automatically switches to **`arch="gpt2"`**:
+From-scratch training defaults to **`arch="modern"`**, which keeps the classic Transformer block layout while swapping in modern LLM upgrades that train faster and stay stable at higher learning rates. Whenever you load pretrained OpenAI GPT-2 weights (`--init-from gpt2`) or a saved GPT-2 checkpoint, Chat Shakespeare automatically switches to **`arch="gpt2"`**:
 
 | Component | `modern` (default from scratch) | `gpt2` (auto-enabled for GPT-2 weights) |
 | :--- | :--- | :--- |
 | **Position encoding** | **RoPE** (Rotary Position Embeddings on Q/K) | Learned position table (`wpe`) |
 | **Normalization** | **`RMSNorm`** (pre-norm + QK-Norm) | `LayerNorm` |
-| **MLP activation** | **`ReLU²`** (`F.relu(x).square()`) | `GELU` (`approximate="tanh"`) |
+| **MLP activation** | **`ReLU²`** (`F.relu(h).square()`) | `GELU` (`F.gelu(h, approximate="tanh")`) |
+| **Linear biases** | `bias=False` by default for scratch training | `bias=True` when loading pretrained GPT-2 |
 
 Let's follow a batch of token IDs of shape `(B, T)` as it travels from the front of [`GPT.forward`](../src/model.py#L304-L344) to the final next-token predictions:
 
 ```mermaid
 flowchart TD
-    IN["Token IDs idx — shape (B, T)"] --> EMB["Token Embedding (wte) [+ wpe for gpt2] + Dropout"]
+    IN["Token IDs idx — shape (B, T)"] --> EMB["Token Embedding (wte) (+ wpe in gpt2) + Dropout"]
     EMB --> X0["Hidden Vectors x — shape (B, T, C)"]
-    X0 --> BLK["Transformer Block × n_layer (Pre-Norm Attention [with RoPE + QK-Norm] + Pre-Norm MLP)"]
+    X0 --> BLK["Transformer Block × n_layer (Pre-Norm Attention + Pre-Norm MLP)"]
     BLK --> LNF["Final Norm (ln_f) — shape (B, T, C)"]
     LNF --> HEAD["Output Linear Head (lm_head, weight-tied with wte)"]
     HEAD --> LOGITS["Logits — shape (B, T, vocab_size)"]
@@ -175,37 +176,39 @@ flowchart TD
 
 ### 3.1 Embeddings: Meaning and Position
 
-> **Code:** [`Transformer`](../src/model.py#L245-L272)
+> **Code:** [`Transformer`](../src/model.py#L245-L272), [`_build_rope_cache`](../src/model.py#L79-L91), and [`_apply_rope`](../src/model.py#L94-L98)
 
-Token ID `42` isn't "greater than" token ID `10` — they are just arbitrary labels. So the very first step converts each integer ID into a **vector** of `n_embd` (e.g., 128 or 384) learnable floating-point numbers:
+Token ID `42` isn't "greater than" token ID `10` — they are just arbitrary labels. So the very first step converts each integer ID into a **vector** of `n_embd` (e.g., `128` on CPU, `384` on MPS/CUDA, `768` on GPT-2 Small) learnable floating-point numbers:
 
 1. **Token Embedding (`wte`)**: A lookup table of shape `(vocab_size, n_embd)`. Think of each row as a learned list of features describing what that token tends to mean and how it behaves.
 2. **Position Information (`RoPE` vs. `wpe`)**: Attention alone treats inputs like a shuffled bag of tokens (`"dog bites man"` looks identical to `"man bites dog"`).
-   - In **`arch="modern"`** (default): instead of adding a learned table at the input, **Rotary Position Embeddings (RoPE)** rotate each Query and Key vector inside attention by an angle proportional to its position so attention naturally sees relative distances.
+   - In **`arch="modern"`** (default): instead of adding a learned table at the input, **Rotary Position Embeddings (RoPE)** rotate pairs of coordinates in each Query and Key vector inside attention like clock hands turning with position. When a Query and Key take a dot product, the angle *between* them naturally encodes **relative distance**! *(Because RoPE rotates dimensions in pairs, `arch="modern"` requires `head_dim = n_embd // n_head` to be even.)*
    - In **`arch="gpt2"`**: a learned position table (`wpe`) of shape `(block_size, n_embd)` is looked up and added to `wte(idx)`.
+
+*(Both the precomputed RoPE cosine/sine tables and GPT-2's `pos` index tensor are registered as non-persistent buffers so they move to your GPU automatically without bloating saved checkpoints.)*
 
 Now every token at every position has its own rich vector of size `C = n_embd`, giving tensor shape **`(B, T, C)`**.
 
-*(The `drop` step is **Dropout**: during training, it randomly zeroes out a fraction of numbers—e.g. `0.1` or `0.2`—forcing the model not to over-rely on any single memorized path.)*
+*(The `drop` step is **Dropout**: during training, it randomly zeroes out a fraction of numbers — e.g., `0.1` on CPU or `0.2` on MPS/CUDA — forcing the model not to over-rely on any single memorized path.)*
 
 ### 3.2 The Transformer Block: Communicate, Then Think
 
 > **Code:** [`Block`](../src/model.py#L224-L242)
 
-The core of GPT is simply a stack of `n_layer` identical **Transformer Blocks** (4 layers on CPU, 6 on MPS/CUDA, 12 on GPT-2 Small). Each block updates every token's vector in two stages:
+The core of GPT is simply a stack of `n_layer` identical **Transformer Blocks** (4 layers on CPU, 6 on MPS/CUDA, 12 on GPT-2 Small, up to 48 on GPT-2 XL). Each block updates every token's vector in two stages:
 
 ```python
 x = x + self.attn(
     self.ln_1(x), rope=rope, pos_offset=pos_offset, kv_cache=kv_cache
-)  # 1. Communicate
-x = x + self.mlp(self.ln_2(x))  # 2. Think individually about what was gathered
+)  # 1. Communicate with earlier tokens
+return x + self.mlp(self.ln_2(x))  # 2. Think individually about what was gathered
 ```
 
-Think of a group of readers sitting in a row, each holding one character of a sentence:
-1. **Attention (`attn`)** is the **communication step**: each reader asks earlier readers for context (*"Are we inside a character name? Did someone just open a quote? What word started two tokens ago?"*).
+Think of a group of readers sitting in a row, each holding one token of a sentence:
+1. **Attention (`attn`)** is the **communication step**: each reader asks earlier readers for context (*"Are we inside a character name? Did someone just open a quote? What phrase started a few tokens ago?"*).
 2. **MLP (`mlp`)** is the **thinking step**: each reader privately digests the notes they just collected before passing their updated vector to the next layer.
 
-Repeating this 4 to 6 times lets the network build progressively higher-level understanding—from pairs of characters in early layers, to whole words, to grammar and dramatic dialogue in deeper layers.
+Repeating this 4 to 6 times lets the network build progressively higher-level understanding — from neighboring tokens in early layers, to whole words and syntax, to speaker turns and dramatic dialogue in deeper layers.
 
 ### 3.3 Causal Self-Attention: Looking Backward for Context
 
@@ -225,7 +228,7 @@ $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_{\te
 Let's unpack every single piece of that formula:
 1. **Dot product ($Q K^\top$)**: Measures compatibility. High score = *"this earlier token has what I'm looking for!"*
 2. **Scaling ($\div \sqrt{d_{\text{head}}}$)**: Keeps dot products from growing too large as vectors get wider; otherwise softmax turns overly sharp and training stalls.
-3. **Causal Mask (`is_causal=True`)**: Blocks every token from looking into the **future**. Token #4 can only attend to tokens #0, #1, #2, #3, #4 — never #5 or #6. Without this mask, the model would cheat during training by peeking ahead at the answer!
+3. **Causal Mask**: Blocks every token from looking into the **future**. Token #3 can only attend to tokens #0, #1, #2, #3 — never #4 or #5. Without this mask, the model would cheat during training by peeking ahead at the answer!
    ```text
    Token attending ↓  | Can look at →  0   1   2   3
    -------------------+-----------------------------
@@ -241,10 +244,12 @@ Let's unpack every single piece of that formula:
 Instead of doing one big attention lookup over all `n_embd` numbers, we split each vector into `n_head` parallel **heads**, each of width `head_dim = n_embd // n_head` (which is why `n_embd` must be divisible by `n_head`!).
 
 - On `mps` / `cuda`: `n_embd = 384`, `n_head = 6` → **6 heads**, each of dimension **64**.
-- Different heads naturally specialize: one might track the previous 2 characters for spelling, another might track newlines and colons for speaker turns, another might look further back for rhyming or punctuation.
+- Different heads naturally specialize: one might track the previous couple of tokens for spelling or phrasing, another might track newlines and colons for speaker turns, another might look further back for rhythm or punctuation.
 - Afterward, the heads are stitched back together into `(B, T, C)` and mixed via `c_proj`.
 
-> **PyTorch 2.x Bonus:** [`F.scaled_dot_product_attention(..., is_causal=True)`](../src/model.py#L198-L205) handles the scaling, causal masking, softmax, and dropout in one call — and automatically dispatches to ultra-fast fused kernels (like FlashAttention on CUDA) under the hood. In `arch="modern"`, queries and keys also pass through per-head [`RMSNorm`](../src/model.py#L64-L76) (**QK-Norm**) before RoPE rotation so attention logits stay well-scaled at higher learning rates.
+> **Modern Upgrades Inside Attention:**
+> - **Fused Attention (`F.scaled_dot_product_attention`)**: [`src/model.py`](../src/model.py#L198-L205) lets PyTorch handle scaling, masking, softmax, and dropout in one call — automatically dispatching to ultra-fast fused kernels (like FlashAttention on CUDA). During training it sets `is_causal=True`; during KV-cached decoding it automatically adapts the causal mask for single-token or multi-token appends.
+> - **QK-Norm (`arch="modern"`)**: Right before RoPE rotation, queries and keys each pass through per-head [`RMSNorm`](../src/model.py#L64-L76). Without it, attention dot products can occasionally spike at higher learning rates and cause softmax to collapse onto a single token.
 
 ### 3.4 The MLP: Thinking About What Was Gathered
 
@@ -253,41 +258,47 @@ Instead of doing one big attention lookup over all `n_embd` numbers, we split ea
 After attention gathers context across positions, each token independently passes through a two-layer **Multi-Layer Perceptron (MLP)** (also called a Feed-Forward Network):
 
 1. **Expand 4×** (`c_fc`): `n_embd` → `4 * n_embd` (gives the network extra scratchpad space to compute complex feature combinations).
-2. **Activation (`ReLU²` or `GELU`)**: Applies a nonlinear curve (`F.relu(x).square()` in `modern`, `GELU(approximate="tanh")` in `gpt2`). Without a nonlinearity, stacking linear layers would mathematically collapse into a single matrix multiplication and couldn't learn complex patterns!
+2. **Activation (`ReLU²` or `GELU`)**: Applies a nonlinear curve — **`ReLU²`** (`F.relu(h).square()`) in `modern`, or **`GELU`** (`F.gelu(h, approximate="tanh")`) in `gpt2`. Without a nonlinearity, stacking linear layers would mathematically collapse into a single matrix multiplication and couldn't learn complex patterns! `ReLU²` is fast, cleanly zeroes out negative activations for sparsity, and trains noticeably well on compact Transformers.
 3. **Compress back** (`c_proj`): `4 * n_embd` → `n_embd`, followed by dropout.
 
-### 3.5 Residual Connections and Normalization (`RMSNorm` / `LayerNorm`)
+### 3.5 Residual Connections and Normalization
 
 Look again at those two lines in [`Block.forward`](../src/model.py#L232-L242):
 
 ```python
-x = x + self.attn(self.ln_1(x), rope=rope, pos_offset=pos_offset, kv_cache=kv_cache)
-x = x + self.mlp(self.ln_2(x))
+x = x + self.attn(
+    self.ln_1(x), rope=rope, pos_offset=pos_offset, kv_cache=kv_cache
+)
+return x + self.mlp(self.ln_2(x))
 ```
 
 Two quiet engineering ideas here are what make deep Transformers actually trainable:
 
-- **Residual Connections (`x + ...`)**: Instead of overwriting `x`, each layer adds a *refinement* onto `x`. Think of `x` as a clean "information highway" running straight from the input to the output. During backpropagation, gradients can flow directly down that highway without fading away (`vanishing gradients`).
+- **Residual Connections (`x + ...`)**: Instead of overwriting `x`, each layer adds a *refinement* onto `x`. Think of `x` as a clean "information highway" running straight from the input to the output. During backpropagation, gradients can flow directly down that highway without fading away (*vanishing gradients*).
   *(This is also why [`GPT.__init__`](../src/model.py#L285-L288) scales down the initial weights of every `c_proj` layer by $1 / \sqrt{2 \cdot n_{\text{layer}}}$: it keeps the residual stream from growing wildly as more blocks add onto it.)*
-- **Pre-Norm (`ln_1`, `ln_2`, `ln_f`)**: Before entering attention or the MLP, [`RMSNorm`](../src/model.py#L64-L76) (in `modern`) or `LayerNorm` (in `gpt2`) rescales each token vector's magnitude. That keeps activation values stable and prevents numbers from exploding or shrinking to zero across layers.
+- **Pre-Norm (`ln_1`, `ln_2`, `ln_f`)**: Before entering attention or the MLP, each token vector's magnitude is rescaled so numbers neither explode nor shrink to zero across layers:
+  - **`RMSNorm`** (default in `modern`, [`src/model.py`](../src/model.py#L64-L76)): divides by the vector's root-mean-square magnitude and applies a learned scale (skipping mean-centering for speed and simplicity, while cleanly matching the activation dtype under mixed-precision autocast).
+  - **`LayerNorm`** (used in `gpt2`): subtracts the mean and divides by the standard deviation before scaling.
 
 ### 3.6 Predicting the Next Token and Weight Tying
 
-> **Code:** [`GPT`](../src/model.py#L275-L344)
+> **Code:** [`GPT.__init__`](../src/model.py#L275-L289) and [`GPT.forward`](../src/model.py#L304-L344)
 
 After the final Transformer block and final normalization (`ln_f`), the **language modeling head (`lm_head`)** projects each token's `n_embd` vector into `vocab_size` raw scores called **logits** — one score for every token in the vocabulary.
 
 Two neat details in [`src/model.py`](../src/model.py):
-- **Weight Tying** (`self.transformer.wte.weight = self.lm_head.weight`): The input token embedding table and the final output projection share the **exact same matrix**! Intuitively, if two tokens behave similarly going *in*, they should also occupy similar directions coming *out*. This also cuts down parameter count and improves generalization.
-- **Training & inference fast paths**: During training (`targets is not None` with `return_logits=False`), `GPT.forward` computes cross-entropy loss and returns `(None, loss)` so mixed-precision wrappers never allocate a giant float32 logits tensor. During text generation (`targets is None`), we only run `lm_head` on the very last position `x[:, [-1], :]` and reuse cached keys/values via [`KVCache`](../src/model.py#L107-L142).
+- **Weight Tying** (`self.transformer.wte.weight = self.lm_head.weight`): The input token embedding table and the final output projection share the **exact same matrix**! Intuitively, if two tokens behave similarly going *in*, they should also occupy similar directions coming *out*. This cuts down parameter count and improves generalization.
+- **Training & inference fast paths**: During training (`targets is not None` with `return_logits=False`), `GPT.forward` computes cross-entropy loss and returns `(None, loss)` so mixed-precision wrappers never keep a giant logits tensor alive. During text generation (`targets is None`), we only run `lm_head` on the very last position `x[:, [-1], :]` and reuse cached keys/values via [`KVCache`](../src/model.py#L107-L142).
 
 ### 3.7 Bonus: Loading Real Pretrained GPT-2 Weights
 
-> **Code:** [`GPT.from_pretrained`](../src/model.py#L374-L446) and [`crop_block_size`](../src/model.py#L346-L371)
+> **Code:** [`GPT.from_pretrained`](../src/model.py#L374-L446), [`crop_block_size`](../src/model.py#L346-L371), and [`infer_arch_from_weights`](../src/hyperparameters.py#L123-L131)
 
-Even though [`src/model.py`](../src/model.py) is compact, switching `arch="gpt2"` makes it **architecturally identical to OpenAI's GPT-2** (`gpt2`, `gpt2-medium`, `gpt2-large`, `gpt2-xl`). `GPT.from_pretrained("gpt2")` downloads the official `model.safetensors` weights straight from a pinned Hugging Face Hub revision — without even needing the `transformers` library — transposes OpenAI's 4 `Conv1D` matrices to match PyTorch's `nn.Linear`, pads the 50,257-row vocabulary cleanly to `50,304`, and loads them directly into our `GPT` class! And both [`TrainConfig.auto`](../src/hyperparameters.py#L502-L567) and [`load_checkpoint`](../src/train.py#L203-L233) automatically switch `arch` to `"gpt2"` whenever GPT-2 weights are detected.
-
-If you want to fine-tune 1024-context GPT-2 with a shorter context window (e.g. `block_size=256`), `crop_block_size` cleanly trims the positional embedding table `wpe` (or RoPE buffers) to fit.
+Even though [`src/model.py`](../src/model.py) is compact, switching `arch="gpt2"` makes it **architecturally identical to OpenAI's GPT-2** across all four sizes (`gpt2` 124M, `gpt2-medium` 355M, `gpt2-large` 774M, `gpt2-xl` 1.5B):
+- `GPT.from_pretrained("gpt2")` downloads the official `model.safetensors` weights straight from a pinned Hugging Face Hub revision — without even needing the `transformers` library or `pickle`.
+- It transposes OpenAI's 4 `Conv1D` matrices to match PyTorch's `nn.Linear`, pads the 50,257-row vocabulary cleanly to `50,304` (zeroing the 47 padding rows), and verifies that every expected weight key matches strictly.
+- **Automatic detection**: passing `--init-from gpt2` automatically sets `arch="gpt2"` and `tokenizer="gpt2"`. You can also pass any saved local checkpoint folder (`--init-from data/checkpoints/<run>`) to continue fine-tuning; both [`TrainConfig.auto`](../src/hyperparameters.py#L502-L567) and [`load_checkpoint`](../src/train.py#L203-L233) inspect `model.safetensors` keys (`wpe.weight`) via [`infer_arch_from_weights()`](../src/hyperparameters.py#L123-L131) so saved checkpoints always load with the right architecture.
+- **Shorter context fine-tuning**: if you fine-tune 1,024-context GPT-2 (or any checkpoint) with a smaller `block_size` (e.g., `block_size=256`), [`crop_block_size()`](../src/model.py#L346-L371) cleanly trims `wpe` / `pos` (or the RoPE tables in `modern`) to fit.
 
 ---
 
