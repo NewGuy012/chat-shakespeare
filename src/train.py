@@ -16,13 +16,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from hyperparameters import TrainConfig
 from model import _PRETRAINED_CONFIGS, GPT, GPTConfig
-from tokenizer import (
-    download,
-    load_tokenizer,
-    save_tensors,
-    tokenize_char,
-    tokenize_gpt2,
-)
+from tokenizer import load_tokenizer, prepare_tokens
 
 
 def build_accelerator(config: TrainConfig) -> Accelerator:
@@ -134,10 +128,11 @@ def _sync_config_from_model(config: TrainConfig, model: GPT) -> None:
 
 def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
     """Initialize GPT (from scratch, HF GPT-2, or local checkpoint) and AdamW optimizer."""
-    if config.meta_path.exists() and config.init_from == "scratch":
-        config.vocab_size, _, _ = load_tokenizer(config.meta_path)
-
     if config.init_from == "scratch":
+        if config.tokenizer == "char" and config.meta_path.exists():
+            config.vocab_size, _, _ = load_tokenizer(config.meta_path)
+        elif config.tokenizer == "gpt2":
+            config.vocab_size = max(config.vocab_size, 50257)
         model = GPT(GPTConfig(**config.model_kwargs()))
     elif config.init_from in _PRETRAINED_CONFIGS:
         model = GPT.from_pretrained(config.init_from, dropout=config.dropout)
@@ -267,21 +262,74 @@ def save_checkpoint(
     accelerator: Accelerator,
     model: torch.nn.Module,
     losses: dict[str, float] | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> Path:
     """Save unwrapped safetensors weights and JSON config via Accelerate."""
+    target_dir = (
+        Path(checkpoint_dir) if checkpoint_dir is not None else config.checkpoint_dir
+    )
     unwrapped = accelerator.unwrap_model(model, keep_torch_compile=False)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
-    accelerator.save_model(unwrapped, config.checkpoint_dir, safe_serialization=True)
+    accelerator.save_model(unwrapped, target_dir, safe_serialization=True)
     if accelerator.is_main_process:
-        meta = {**config.to_dict(), "losses": losses or {}}
-        (config.checkpoint_dir / "config.json").write_text(
+        meta = {
+            **config.to_dict(),
+            "fingerprint": config.fingerprint(),
+            "losses": losses or {},
+        }
+        (target_dir / "config.json").write_text(
             json.dumps(meta, indent=2), encoding="utf-8"
         )
     accelerator.wait_for_everyone()
-    return config.checkpoint_dir
+    return target_dir
+
+
+def checkpoint_ready(
+    config: TrainConfig,
+    checkpoint_dir: Path | None = None,
+) -> bool:
+    """Return True when a complete checkpoint matching config's fingerprint exists."""
+    target_dir = (
+        Path(checkpoint_dir) if checkpoint_dir is not None else config.checkpoint_dir
+    )
+    weights_file = target_dir / "model.safetensors"
+    config_file = target_dir / "config.json"
+    if not weights_file.is_file() or not config_file.is_file():
+        return False
+    try:
+        saved = json.loads(config_file.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return False
+    if not isinstance(saved, dict):
+        return False
+    saved_fp = saved.get("fingerprint")
+    if isinstance(saved_fp, str):
+        return saved_fp == config.fingerprint()
+    try:
+        return TrainConfig.from_dict(saved).fingerprint() == config.fingerprint()
+    except TypeError, ValueError:
+        return False
+
+
+def ensure_checkpoint(
+    config: TrainConfig,
+    accelerator: Accelerator | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Train and save a checkpoint unless a matching cached checkpoint already exists."""
+    if not overwrite and checkpoint_ready(config):
+        msg = f"Using cached checkpoint: {config.checkpoint_dir}"
+        if accelerator is not None:
+            accelerator.print(msg)
+        else:
+            print(msg)
+        return config.checkpoint_dir
+
+    acc, model, losses = train(config, accelerator=accelerator)
+    return save_checkpoint(config, acc, model, losses)
 
 
 def main() -> None:
@@ -290,13 +338,15 @@ def main() -> None:
     )
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None)
     parser.add_argument("--init-from", default="scratch")
-    parser.add_argument("--tokenizer", choices=("char", "gpt2"), default="char")
+    parser.add_argument("--tokenizer", choices=("char", "gpt2"), default=None)
     parser.add_argument("--max-iters", type=int, default=None)
     parser.add_argument("--data-path", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     overrides: dict[str, object] = {"init_from": args.init_from}
+    if args.tokenizer is not None:
+        overrides["tokenizer"] = args.tokenizer
     if args.max_iters is not None:
         overrides["max_iters"] = args.max_iters
     if args.data_path is not None:
@@ -304,24 +354,11 @@ def main() -> None:
     config = TrainConfig.auto(device=args.device, **overrides)
     accelerator = build_accelerator(config)
 
-    if (
-        args.overwrite
-        or not config.train_path.exists()
-        or not config.val_path.exists()
-        or not config.meta_path.exists()
-    ):
-        if accelerator.is_main_process:
-            ds = download(config)
-            tokenized = (
-                tokenize_gpt2(config, ds)
-                if args.tokenizer == "gpt2"
-                else tokenize_char(config, ds)
-            )
-            save_tensors(config, tokenized)
-        accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        prepare_tokens(config, overwrite=args.overwrite)
+    accelerator.wait_for_everyone()
 
-    _, model, losses = train(config, accelerator=accelerator)
-    save_checkpoint(config, accelerator, model, losses)
+    ensure_checkpoint(config, accelerator=accelerator, overwrite=args.overwrite)
 
 
 if __name__ == "__main__":

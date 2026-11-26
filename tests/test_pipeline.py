@@ -24,7 +24,17 @@ from tokenizer import (
     tokenize_gpt2,
     tokens_ready,
 )
-from train import get_lr, save_checkpoint, train
+from train import (
+    checkpoint_ready,
+    ensure_checkpoint,
+    get_lr,
+    load_checkpoint,
+    save_checkpoint,
+    train,
+)
+from train import (
+    main as train_main,
+)
 
 
 class PipelineTests(unittest.TestCase):
@@ -237,13 +247,159 @@ class PipelineTests(unittest.TestCase):
             ckpt_dir = save_checkpoint(cfg, acc, trained_model, losses)
             self.assertTrue((ckpt_dir / "model.safetensors").exists())
             self.assertTrue((ckpt_dir / "config.json").exists())
+            self.assertTrue(checkpoint_ready(cfg))
+
+            ckpt_cfg, loaded_model = load_checkpoint(ckpt_dir, device="cpu")
+            self.assertEqual(ckpt_cfg.checkpoint_dir, ckpt_dir)
 
             texts = sample(
                 cfg,
                 SampleConfig(start="First", num_samples=1, max_new_tokens=6, top_k=5),
+                model=loaded_model,
             )
             self.assertEqual(len(texts), 1)
             self.assertTrue(texts[0].startswith("First"))
+
+    def test_ensure_checkpoint_caches_and_isolates_runs(self) -> None:
+        ds = {
+            "train": {
+                "text": [
+                    "First Citizen:\nBefore we proceed any further, hear me speak.\n"
+                    * 8
+                ]
+            },
+            "test": {"text": ["All:\nSpeak, speak.\n" * 6]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = TrainConfig.auto(
+                "cpu",
+                data_path=Path(tmp),
+                block_size=8,
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                n_layer=1,
+                n_head=2,
+                n_embd=16,
+                max_iters=2,
+                warmup_iters=1,
+                log_iters=1,
+                eval_iters=1,
+            )
+            expected_dir = cfg.checkpoint_dir
+            with patch("tokenizer.download", return_value=ds):
+                prepare_tokens(cfg)
+            self.assertEqual(cfg.checkpoint_dir, expected_dir)
+
+            first_dir = ensure_checkpoint(cfg)
+            self.assertEqual(first_dir, expected_dir)
+            self.assertTrue(checkpoint_ready(cfg))
+
+            # Same hyperparameters (even with different log_iters) hit the cache.
+            same_cfg = TrainConfig.auto(
+                "cpu",
+                data_path=Path(tmp),
+                block_size=8,
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                n_layer=1,
+                n_head=2,
+                n_embd=16,
+                max_iters=2,
+                warmup_iters=1,
+                log_iters=99,
+                eval_iters=1,
+            )
+            with patch("train.train") as mock_train:
+                hit_dir = ensure_checkpoint(same_cfg)
+                mock_train.assert_not_called()
+            self.assertEqual(hit_dir, first_dir)
+
+            # Different training hyperparameter creates a second checkpoint without overwriting.
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            other_cfg = TrainConfig.auto(
+                "cpu",
+                data_path=Path(tmp),
+                block_size=8,
+                batch_size=2,
+                gradient_accumulation_steps=1,
+                n_layer=1,
+                n_head=2,
+                n_embd=16,
+                max_iters=3,
+                warmup_iters=1,
+                log_iters=1,
+                eval_iters=1,
+            )
+            second_dir = ensure_checkpoint(other_cfg)
+            self.assertNotEqual(second_dir, first_dir)
+            self.assertTrue(checkpoint_ready(cfg))
+            self.assertTrue(checkpoint_ready(other_cfg))
+
+            # overwrite=True forces retraining even when cached.
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            with patch("train.train", wraps=train) as mock_train:
+                ensure_checkpoint(cfg, overwrite=True)
+                self.assertEqual(mock_train.call_count, 1)
+
+    def test_cli_main_uses_caches_and_infers_gpt2_tokenizer(self) -> None:
+        ds = {
+            "train": {
+                "text": [
+                    "First Citizen:\nBefore we proceed any further, hear me speak.\n"
+                    * 16
+                ]
+            },
+            "test": {"text": ["All:\nSpeak, speak.\n" * 20]},
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("tokenizer.download", return_value=ds),
+        ):
+            argv = [
+                "src/train.py",
+                "--device",
+                "cpu",
+                "--data-path",
+                tmp,
+                "--max-iters",
+                "2",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch("train.train", wraps=train) as spy,
+            ):
+                train_main()
+                self.assertEqual(spy.call_count, 1)
+
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            with patch.object(sys, "argv", argv), patch("train.train") as mock_train:
+                train_main()
+                mock_train.assert_not_called()
+
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            gpt2_argv = [
+                "src/train.py",
+                "--device",
+                "cpu",
+                "--init-from",
+                "gpt2",
+                "--data-path",
+                tmp,
+                "--max-iters",
+                "2",
+            ]
+            with (
+                patch.object(sys, "argv", gpt2_argv),
+                patch("train.ensure_checkpoint") as mock_ensure,
+            ):
+                train_main()
+                called_cfg = mock_ensure.call_args.args[0]
+                self.assertEqual(called_cfg.tokenizer, "gpt2")
+                self.assertTrue((Path(tmp) / "tokens" / "gpt2" / "meta.json").is_file())
 
 
 if __name__ == "__main__":
