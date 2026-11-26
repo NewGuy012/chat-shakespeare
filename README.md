@@ -15,17 +15,19 @@ cd chat-shakespeare
 uv sync
 ```
 
-Run interactively with marimo or via Accelerate CLI:
+Run interactively with marimo (preferred for local exploration) or from the CLI:
 
 ```bash
+# Preferred locally: interactive notebook (tokenizes, trains, and samples)
 uv run marimo edit main.py
 
-# Auto-detect CPU / MPS / CUDA
-uv run accelerate launch src/train.py
+# Single-machine CLI: applies TrainConfig.auto() precision & compile defaults
+uv run python src/train.py
 
-# Force CPU preset or fine-tune pretrained GPT-2
+# Multi-GPU / distributed or custom Accelerate flags
+uv run accelerate launch --multi_gpu --mixed_precision bf16 src/train.py
 uv run accelerate launch --cpu src/train.py
-uv run accelerate launch src/train.py --init-from gpt2 --tokenizer gpt2
+uv run accelerate launch --mixed_precision bf16 src/train.py --init-from gpt2 --tokenizer gpt2
 ```
 
 Run tests:
