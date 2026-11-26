@@ -15,8 +15,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--2--Clause-2563EB" alt="BSD-2-Clause License" /></a>
 </p>
 
-- **From-scratch GPT**: Modern default scratch architecture (`RMSNorm`, RoPE, QK-Norm, `ReLU²`) with `F.scaled_dot_product_attention`, fused `AdamW`, KV-cached batched sampling, and automatic `gpt2` switching when loading pretrained or saved GPT-2 `safetensors` weights (no `transformers` or `pickle`).
-- **Hardware-aware training**: [`TrainConfig.auto()`](src/hyperparameters.py) tunes model size, on-device batching (`TokenBatcher`), precision, and CUDA Graphs (`reduce-overhead`) automatically for CPU (`fp32`), Apple Silicon MPS (`bf16`), and CUDA (`<12GB`, `12–39GB`, and `>=40GB` VRAM tiers).
+- **From-scratch GPT**: Modern default scratch architecture (`RMSNorm`, RoPE, QK-Norm, `ReLU²`) with `F.scaled_dot_product_attention`, fused `AdamW`, KV-cached batched sampling, and automatic `gpt2` switching when loading pretrained (revision-pinned) or saved GPT-2 `safetensors` weights (no `transformers` or `pickle`).
+- **Hardware-aware training**: [`TrainConfig.auto()`](src/hyperparameters.py) tunes model size, unified `TokenBatcher` placement (on-device `<= 256 MB`, CPU-backed above), precision, and CUDA Graphs (`reduce-overhead`) automatically for CPU (`fp32`), Apple Silicon MPS (`bf16`), and CUDA (`<12GB`, `12–39GB`, and `>=40GB` VRAM tiers).
 
 ## Quickstart
 
