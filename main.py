@@ -22,12 +22,12 @@ def _():
 def _(config):
     overwrite = False
     tokenize(config, overwrite=overwrite)
-    training(config, overwrite=overwrite)
-    return
+    checkpoint_dir = training(config, overwrite=overwrite)
+    return (checkpoint_dir,)
 
 
 @app.cell
-def _(config):
+def _(checkpoint_dir, config):
     sample_config = SampleConfig(
         num_samples=1,
         max_new_tokens=500,
@@ -51,6 +51,7 @@ def training(config, overwrite=False):
     if overwrite or not ckpt_ready:
         accelerator, model, losses = train(config)
         save_checkpoint(config, accelerator, model, losses)
+    return config.checkpoint_dir
 
 
 if __name__ == "__main__":
