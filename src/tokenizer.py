@@ -1,200 +1,140 @@
-import marimo
+from __future__ import annotations
 
-__generated_with = "0.20.4"
-app = marimo.App(width="full", sql_output="native")
+import json
+from collections.abc import Callable
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-with app.setup:
-    import torch
-    import pickle
-    import tiktoken
-    import marimo as mo
+import tiktoken
+import torch
+from datasets import DatasetDict, load_dataset, load_from_disk
+from safetensors.torch import save_file
 
-    from pathlib import Path
-    from transformers import AutoTokenizer
-    from torch.utils.data import DataLoader
-    from safetensors.torch import save_file
-    from datasets import DatasetDict, load_dataset, load_from_disk
-
-    enc = tiktoken.get_encoding("gpt2")
+from hyperparameters import TrainConfig
 
 
-@app.function
-def download(config):
-    download_path = config["download_path"]
-    
-    if download_path.exists():
-        dataset = load_from_disk(download_path)
-    else:
-        # jchwenger/tiny_shakespeare 
-        dataset = load_dataset("Trelis/tiny-shakespeare")
+@lru_cache(maxsize=1)
+def _gpt2_encoding() -> tiktoken.Encoding:
+    return tiktoken.get_encoding("gpt2")
+
+
+def _split_texts(ds: DatasetDict | dict[str, Any]) -> tuple[list[str], list[str]]:
+    val_split = "validation" if "validation" in ds else "test"
+    return list(ds["train"]["text"]), list(ds[val_split]["text"])
+
+
+def download(config: TrainConfig) -> DatasetDict:
+    """Download or load cached tiny-shakespeare dataset."""
+    if config.download_path.exists():
+        return load_from_disk(config.download_path)
+
+    dataset = load_dataset("Trelis/tiny-shakespeare")
+    if "Text" in dataset["train"].column_names:
         dataset = dataset.rename_column("Text", "text")
-    
-        dataset.save_to_disk(download_path)
-
+    config.download_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset.save_to_disk(config.download_path)
     return dataset
 
 
-@app.function
-def tokenize_gpt2(config, ds):
-    # Load the standard Python tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-    def tokenization(ds):
-        token_dict = tokenizer(ds["text"])
-
-        input_ids = token_dict["input_ids"]
-
-        for input_id in input_ids:
-            input_id.append(enc.eot_token)
-
-        token_dict["input_ids"] = input_ids
-
-        return token_dict
-
-    # Batch tokenize
-    tokenized = ds.map(
-        tokenization,
-        remove_columns=['text'],
-        desc="HF tokenizer",
-        batched=True)
-
-    meta = {
-        'vocab_size': config["vocab_size"],
-        'encode': encode_gpt2,
-        'decode': decode_gpt2,
-    }
-    save_meta(config, meta)
-
-    return tokenized
+def save_meta(config: TrainConfig, meta: dict[str, Any]) -> None:
+    """Write tokenizer metadata as JSON (pickle-free)."""
+    config.meta_path.parent.mkdir(parents=True, exist_ok=True)
+    config.meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-@app.function
-def encode_gpt2(s):
-    return enc.encode(s, allowed_special={"<|endoftext|>"})
+def tokenize_char(config: TrainConfig, ds: DatasetDict | dict[str, Any]) -> dict[str, list[int]]:
+    """Character-level tokenize train/val splits and persist metadata."""
+    train_items, val_items = _split_texts(ds)
+    train_text = "".join(train_items)
+    val_text = "".join(val_items)
+    chars = sorted(set(train_text + val_text))
+    if not chars:
+        raise ValueError("Cannot build character vocabulary from empty dataset")
 
+    stoi = {c: i for i, c in enumerate(chars)}
+    config.vocab_size = len(chars)
+    print(f"\nTokenize text (char): vocab_size={config.vocab_size:,}")
 
-@app.function
-def decode_gpt2(l):
-    return enc.decode(l)
-
-
-@app.function
-def tokenize_tiktoken(config, ds):
-    def process(ds):
-        ids = enc.encode_ordinary(ds['text']) # encode_ordinary ignores any special tokens
-        ids.append(enc.eot_token)
-        out = {'ids': ids, 'len': len(ids)}
-        return out
-
-    # tokenize the dataset
-    tokenized = ds.map(
-        process,
-        remove_columns=['text'],
-        desc="Tokenizing the splits"
+    save_meta(
+        config,
+        {
+            "tokenizer": "char",
+            "vocab_size": config.vocab_size,
+            "chars": "".join(chars),
+        },
     )
-
-    meta = {
-        'vocab_size': config["vocab_size"],
-        'encode': encode_gpt2,
-        'decode': decode_gpt2,
-    }
-    save_meta(config, meta)
-
-    return tokenized
-
-
-@app.function
-def tokenize_char(config, ds):
-    data_path = config["data_path"]
-    tensor_path = data_path / "train.safetensors"
-
-    ds_train = ds["train"]["text"]
-    ds_val = ds["test"]["text"]
-
-    ds_train = [item for sublist in ds_train for item in sublist]
-    ds_val = [item for sublist in ds_val for item in sublist]
-    data = ds_train + ds_val
-
-    # get all the unique characters that occur in this text
-    chars = sorted(list(set(data)))
-    vocab_size = len(chars)
-    unique_chars = ''.join(chars)
-
-    print("\nTokenize text:")
-    print(f"\tVocab size: {vocab_size:,}")
-
-    # create a mapping from characters to integers
-    stoi = { ch:i for i,ch in enumerate(chars) }
-    itos = { i:ch for i,ch in enumerate(chars) }
-
-    # encode both to integers
-    ds_train = encode_char(ds_train, stoi)
-    ds_val = encode_char(ds_val, stoi)
-
-    ds = {
-        "train": {"input_ids": ds_train},
-        "test": {"input_ids": ds_val}
+    return {
+        "train": [stoi[c] for c in train_text],
+        "val": [stoi[c] for c in val_text],
     }
 
-    meta = {
-        'vocab_size': vocab_size,
-        'encode': encode_char,
-        'decode': decode_char,
-        'stoi': stoi,
-        'itos': itos
+
+def tokenize_gpt2(config: TrainConfig, ds: DatasetDict | dict[str, Any]) -> dict[str, list[int]]:
+    """Tokenize train/val splits with GPT-2 BPE (tiktoken) and persist metadata."""
+    enc = _gpt2_encoding()
+    train_items, val_items = _split_texts(ds)
+
+    def encode_split(items: list[str]) -> list[int]:
+        ids: list[int] = []
+        for text in items:
+            ids.extend(enc.encode_ordinary(text))
+            ids.append(enc.eot_token)
+        return ids
+
+    vocab_size = max(config.vocab_size, enc.n_vocab)
+    config.vocab_size = vocab_size
+    print(f"\nTokenize text (gpt2): vocab_size={vocab_size:,}")
+
+    save_meta(
+        config,
+        {
+            "tokenizer": "gpt2",
+            "vocab_size": vocab_size,
+        },
+    )
+    return {
+        "train": encode_split(train_items),
+        "val": encode_split(val_items),
     }
-    save_meta(config, meta)
-
-    return ds
 
 
-@app.function
-def encode_char(s, stoi):
-    return [stoi[c] for c in s]
+def save_tensors(config: TrainConfig, tokenized: dict[str, list[int]]) -> None:
+    """Persist tokenized train and val splits as safetensors."""
+    config.data_path.mkdir(parents=True, exist_ok=True)
+    save_file({"train": torch.tensor(tokenized["train"], dtype=torch.long)}, config.train_path)
+    save_file({"val": torch.tensor(tokenized["val"], dtype=torch.long)}, config.val_path)
 
 
-@app.function
-def decode_char(l, itos):
-    return ''.join([itos[i] for i in l])
+def load_tokenizer(
+    meta_path: Path | None = None,
+) -> tuple[int, Callable[[str], list[int]], Callable[[list[int]], str]]:
+    """Return (vocab_size, encode, decode) from meta.json or default GPT-2 BPE."""
+    if meta_path is not None and meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("tokenizer") == "char":
+            chars = meta["chars"]
+            stoi = {c: i for i, c in enumerate(chars)}
+            itos = {i: c for i, c in enumerate(chars)}
 
+            def encode_char(text: str) -> list[int]:
+                unknown = sorted({c for c in text if c not in stoi})
+                if unknown:
+                    raise ValueError(f"Unsupported character(s) for char tokenizer: {unknown}")
+                return [stoi[c] for c in text]
 
-@app.function
-def save_meta(config, meta):
-    data_path = config["data_path"]
+            def decode_char(ids: list[int]) -> str:
+                return "".join(itos[i] for i in ids)
 
-    save_path = data_path / "meta.pkl"
+            return len(chars), encode_char, decode_char
 
-    with open(save_path, 'wb') as f:
-        pickle.dump(meta, f)
-
-
-@app.function
-def save_tensors(config, ds):
-    data_path = config["data_path"]
-    train_path = data_path / "train.safetensors"
-    val_path = data_path / "val.safetensors"
-
-    if isinstance(ds, DatasetDict):
-        ds.set_format(type='torch', columns=['input_ids'])
-
-        ds_train = torch.cat(ds["train"]["input_ids"][:])
-        ds_val = torch.cat(ds["test"]["input_ids"][:])
-
+        vocab_size = int(meta.get("vocab_size", 50304))
     else:
-        ds_train = torch.tensor(ds["train"]["input_ids"])
-        ds_val = torch.tensor(ds["test"]["input_ids"])
+        vocab_size = 50304
 
-    train_tensor = {
-        "train": ds_train
-    }
-    val_tensor = {
-        "val": ds_val
-    }
+    enc = _gpt2_encoding()
 
-    save_file(train_tensor, train_path)
+    def encode_gpt2(text: str) -> list[int]:
+        return enc.encode(text, allowed_special={"<|endoftext|>"})
 
-    save_file(val_tensor, val_path)
-
-
-if __name__ == "__main__":
-    app.run()
+    return vocab_size, encode_gpt2, enc.decode
