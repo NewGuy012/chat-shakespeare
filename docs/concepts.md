@@ -310,7 +310,7 @@ At step 0, all weights are random noise, so the model outputs pure gibberish. Tr
 
 ```mermaid
 flowchart LR
-    A["1. Grab batch (x, y)"] --> B["2. Forward pass (logits & loss)"]
+    A["1. Grab batch (x, y)"] --> B["2. Forward pass (loss)"]
     B --> C["3. Backward pass (gradients)"]
     C --> D["4. Clip gradients & set LR"]
     D --> E["5. AdamW weight update"]
@@ -328,27 +328,29 @@ How do we score the model's guesses? With **Cross-Entropy Loss** (`F.cross_entro
 - If the model gave the right token a tiny probability ($p = 0.01$), loss = $-\ln(0.01) \approx 4.61$ (big penalty!).
 
 #### Sanity-Check Math You Can Verify Live!
-At step 0, with random weights and a vocabulary of size $V$, the model assigns roughly $1/V$ probability to every token:
+At step 0, with random weights and a model output table of size $V$ (after rounding up to a multiple of 64), the untrained model assigns roughly $1/V$ probability to every output slot:
 
 $$\text{Expected initial loss} = -\ln\!\left(\frac{1}{V}\right) = \ln(V)$$
 
-- With the default **1,024-token BPE** vocabulary: $\ln(1024) \approx 6.93$.
-- With the **65-character** vocabulary (`--tokenizer char`): $\ln(65) \approx 4.17$.
+- **Default 1,024-token BPE** ($V = 1024$): $\ln(1024) \approx 6.93$.
+- **65-character tokenizer** (`--tokenizer char`, padded to $V = 128$ in the model): $\ln(128) \approx 4.85$ *(even though only 65 characters exist, the random initial weights spread probability across all 128 padded slots; within a few steps the model learns to push the 63 unused slots toward zero!)*.
+- **GPT-2 BPE from scratch** (`--tokenizer gpt2`, padded to $V = 50,304$): $\ln(50304) \approx 10.83$.
 
-When you run training, watch **Step 0** in the logs — it will start right around that theoretical baseline! *(Note: raw cross-entropy loss rises with larger vocabularies because each step predicts one of $V$ tokens instead of one character, so compare checkpoints with the same tokenizer—or compare bits per byte across tokenizers.)*
+When you run training, watch **Step 0** in the logs — it will start right around that theoretical baseline! *(Note: raw cross-entropy loss rises with larger vocabularies because each step predicts one of $V$ tokens instead of one character, so only compare losses directly across checkpoints that share the same tokenizer.)*
 
-#### Watching for Overfitting
-Every `log_iters` steps, [`estimate_loss`](../src/train.py#L286-L308) evaluates the average loss on both `train` and `val` data:
+#### Watching Logs, Overfitting, and Early Stopping
+Every `log_iters` steps (and on the final iteration), [`estimate_loss`](../src/train.py#L286-L308) evaluates the average loss on both `train` and `val` splits, and [`train`](../src/train.py#L311-L429) prints `train loss`, `val loss`, gradient `norm`, and throughput (`ms/iter` and `tok/s`):
 - **Healthy learning**: both `train loss` and `val loss` drop together.
-- **Overfitting**: `train loss` keeps dropping, while `val loss` flattens out or starts **rising** — meaning the model is memorizing the training lines instead of learning general Shakespearean patterns. Pass `--early-stopping N` to automatically stop after `N` non-improving evals and restore the best validation checkpoint.
+- **Overfitting**: `train loss` keeps dropping, while `val loss` flattens out or starts **rising** — meaning the model is memorizing the training lines instead of learning general Shakespearean patterns.
+- **Early stopping**: pass `--early-stopping N` (or `early_stopping_patience=N`) to snapshot the best validation weights in CPU memory whenever `val loss` improves, stop automatically after `N` consecutive non-improving evaluations, and restore those best weights before saving!
 
 ### 4.2 Backpropagation, AdamW, and Gradient Clipping
 
 - **Backpropagation (`accelerator.backward(loss)`)**: Uses calculus (the chain rule) to compute a **gradient** for every single weight — a number saying *"if you nudge this weight slightly up, does the loss go up or down, and by how much?"*
-- **Gradient Clipping (`grad_clip = 1.0`)**: Occasionally a weird batch produces a giant gradient spike that can derail training. Clipping caps the combined gradient length (printed as `norm` in the training logs) to `1.0` so no single step causes an explosion — and [`train`](../src/train.py#L311-L429) keeps that scalar on-device until `log_iters` so async GPU/MPS queues never stall between log intervals.
+- **Gradient Clipping (`grad_clip = 1.0`)**: Occasionally a weird batch produces a giant gradient spike that can derail training. Whenever gradients synchronize (`accelerator.sync_gradients`), clipping caps the combined gradient length (printed as `norm`) to `1.0` so no single step causes an explosion — and [`train`](../src/train.py#L311-L429) keeps that scalar on-device until `log_iters` so async GPU/MPS queues never stall between log intervals.
 - **AdamW Optimizer ([`configure_optimizers`](../src/model.py#L448-L461))**: Rather than taking blind fixed-size steps, AdamW tracks:
   - **Momentum (`beta1 = 0.9`)**: smooths noisy gradients across steps.
-  - **Adaptive step size (`beta2 = 0.99`, or `0.95` on `>=40GB` GPUs)**: automatically takes smaller steps on sensitive parameters and larger steps on quiet ones.
+  - **Adaptive step size (`beta2 = 0.99`, or `0.95` on `>=40GB` GPUs with larger batch size 128)**: automatically takes smaller steps on sensitive parameters and larger steps on quiet ones.
   - **Weight Decay (`weight_decay = 0.1`)**: gently shrinks 2D weight matrices toward zero every step to discourage memorization (notice how [`configure_optimizers`](../src/model.py#L448-L461) intentionally skips weight decay on 1D biases and norm parameters!).
   - **`fused=True`**: combines all the optimizer math into a single fast kernel.
 
@@ -373,18 +375,49 @@ LR
 ```
 
 1. **Linear Warmup (`warmup_iters`)**: Weights start random, so early gradients are noisy. Ramping LR gently from near `0` up to `learning_rate` prevents early instability.
-2. **Cosine Decay**: Gradually lowers LR down to `min_lr` (10% of peak LR) along a smooth cosine curve so the model makes broad progress early and fine-grained refinements late.
+2. **Cosine Decay**: Gradually lowers LR down to `min_lr` (10% of peak LR) along a smooth cosine curve so the model makes broad progress early and fine-grained refinements late. *(Setting `lr_decay_iters=0` disables decay and keeps LR constant after warmup; [`TrainConfig.auto()`](../src/hyperparameters.py#L502-L567) also automatically syncs `lr_decay_iters = max_iters` and `min_lr = 0.1 * learning_rate` whenever you override `max_iters` or `learning_rate`.)*
 
-### 4.4 Hardware Tricks: Mixed Precision, Accumulation, and Accelerate
+### 4.4 Hardware Tricks: Presets, Mixed Precision, Accumulation, and Accelerate
 
-> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L502-L567) and [`build_accelerator`](../src/train.py#L53-L85)
+> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L502-L567), [`_device_preset`](../src/hyperparameters.py#L203-L246), and [`build_accelerator`](../src/train.py#L53-L85)
 
-Modern LLM training uses a few practical tricks so bigger models run fast on modest hardware — all built right into this repo via [Hugging Face Accelerate](https://huggingface.co/docs/accelerate):
+Modern LLM training uses a few practical tricks so bigger models run fast on modest hardware — all built right into this repo via [Hugging Face Accelerate](https://huggingface.co/docs/accelerate) and automatically configured by `TrainConfig.auto()`:
 
-- **Mixed Precision (`bf16` / `fp16` vs. `fp32`)**: Standard floats (`fp32`) use 32 bits per number. Brain Float 16 (`bf16`, used on Apple Silicon macOS 14+ and modern CUDA GPUs) uses half the memory and multiplies much faster, while `accelerator.autocast()` automatically keeps numerically sensitive ops safe (plus TF32 matmul precision on CUDA).
+| Target | Model | Block | Batch × Accum | LR / Beta2 | Iters | Precision | Compile |
+| :--- | :--- | ---: | ---: | ---: | ---: | :--- | :--- |
+| `cpu` | 4L / 4H / 128d (~0.92M) | 128 | 16 × 2 | `1.5e-3` / `0.99` | 1,000 | `no` (`fp32`) | `False` |
+| `mps` | 6L / 6H / 384d (~11.02M) | 256 | 32 × 2 | `1e-3` / `0.99` | 3,000 | `bf16` (macOS 14+) | `False` |
+| `cuda` (`<12GB`) | 6L / 6H / 384d (~11.02M) | 256 | 32 × 2 | `1e-3` / `0.99` | 5,000 | `bf16` / `fp16` | `True` (`reduce-overhead`) |
+| `cuda` (`12–39GB`) | 6L / 6H / 384d (~11.02M) | 256 | 64 × 1 | `1e-3` / `0.99` | 5,000 | `bf16` / `fp16` | `True` (`reduce-overhead`) |
+| `cuda` (`>=40GB`) | 6L / 6H / 384d (~11.02M) | 256 | 128 × 1 | `1.4e-3` / `0.95` | 2,500 | `bf16` | `True` (`reduce-overhead`) |
+
+- **Mixed Precision (`bf16` / `fp16` vs. `fp32`)**: Standard floats (`fp32`) use 32 bits per number. Brain Float 16 (`bf16`, used on Apple Silicon macOS 14+ and modern CUDA GPUs) uses half the memory and multiplies much faster, while `accelerator.autocast()` keeps numerically sensitive ops safe (plus TF32 matmul precision on CUDA). *(Note: Apple MPS does not support `fp16` autocast, so `TrainConfig` validates that MPS only uses `bf16` or `no`.)*
 - **Gradient Accumulation (`gradient_accumulation_steps`)**: Larger batches give cleaner gradient estimates, but might not fit in RAM/VRAM. Instead of running one giant batch of 64, we run **2 micro-batches of 32**, add their gradients together inside `with accelerator.accumulate(model):`, and only update the weights once! Same math as batch size 64, half the peak memory.
-- **On-device batching (`TokenBatcher`) & `torch.compile` (`reduce-overhead`)**: Keeps small datasets resident on-device for zero-copy static `(B, T)` batches and enables CUDA Graphs (`mode="reduce-overhead"`) on CUDA GPUs to minimize kernel launch overhead.
+- **On-device batching (`TokenBatcher`) & `torch.compile` (`reduce-overhead`)**: Keeps small datasets resident on-device for zero-copy static `(B, T)` batches and enables CUDA Graphs (`mode="reduce-overhead"`) on CUDA GPUs to cut down kernel launch overhead.
 - **One Codebase, Any Hardware**: `Accelerate` lets the exact same [`train()`](../src/train.py#L311-L429) function run on CPU, Apple Silicon (`mps`), a single CUDA GPU, or multiple GPUs (`accelerate launch --multi_gpu`, with `gradient_as_bucket_view=True` and `bf16` DDP communication hooks on CUDA).
+
+### 4.5 Smart Caching and Portable Checkpoints
+
+> **Code:** [`TrainConfig.fingerprint`](../src/hyperparameters.py#L396-L440), [`save_checkpoint`](../src/train.py#L432-L458), [`checkpoint_ready`](../src/train.py#L461-L479), and [`ensure_checkpoint`](../src/train.py#L482-L497)
+
+Experimenting with LLMs is way more fun when you don't accidentally overwrite yesterday's best run or wait for unchanged steps to redo work. Everything Chat Shakespeare saves lives cleanly under `data/`:
+
+```text
+data/
+├── download/                              # Pinned Tiny Shakespeare dataset from HF Hub
+├── tokens/
+│   ├── bpe-1024/                          # train.safetensors, val.safetensors, tokenizer.json, meta.json
+│   ├── char/                              # Separate folder per tokenizer (never clobbers bpe!)
+│   └── gpt2/
+└── checkpoints/
+    └── scratch-modern-bpe1024-6l384d-b256-<12-char-sha256>/
+        ├── model.safetensors              # Safe, unwrapped model weights
+        └── config.json                    # Portable hyperparameters, fingerprint, and final losses
+```
+
+- **Fingerprinted runs**: [`TrainConfig.fingerprint()`](../src/hyperparameters.py#L396-L440) hashes every training-relevant hyperparameter (architecture, tokenizer, block size, learning rate, batch size, seed, etc.) into a deterministic SHA-256 digest while ignoring non-training knobs like `log_iters`, `eval_iters`, `compile`, and `data_path`. Change a hyperparameter and you automatically get a fresh folder; re-run the same config and [`ensure_checkpoint()`](../src/train.py#L482-L497) skips straight to the cached checkpoint!
+- **Integrity checks & portability**: [`checkpoint_ready()`](../src/train.py#L461-L479) verifies that `model.safetensors` has valid headers and a matching fingerprint before trusting the cache. [`TrainConfig.to_dict()`](../src/hyperparameters.py#L478-L482) omits machine-local `data_path` when writing `config.json`, so you can copy any checkpoint folder to another machine and [`load_checkpoint()`](../src/train.py#L203-L233) still knows where to find `data/`.
+- **Force a rebuild**: pass `--overwrite` on the CLI (or flip `overwrite_tokens = True` / `overwrite_training = True` in [`main.py`](../main.py)) whenever you want to re-run from scratch for the exact same config.
 
 ---
 
@@ -396,21 +429,24 @@ Once weights are saved in `data/checkpoints/<run>/model.safetensors`, generating
 
 ```text
 Prompt:  "\nROMEO:"
-  Step 1 → model predicts "\n"  → "\nROMEO:\n"
-  Step 2 → model predicts "O"   → "\nROMEO:\nO"
-  Step 3 → model predicts ","   → "\nROMEO:\nO,"
+  Step 1 → model predicts "\n"      → "\nROMEO:\n"
+  Step 2 → model predicts "O,"      → "\nROMEO:\nO,"
+  Step 3 → model predicts " she"    → "\nROMEO:\nO, she"
   ... repeats max_new_tokens times!
 ```
 
 ### Key Details Inside `GPT.generate` and `sample`
-1. **Evaluation Mode & Autocast**: `model.eval()` disables dropout, `@torch.no_grad()` skips gradient tracking, and [`sample`](../src/sample.py#L37-L98) runs batched generation (`num_samples` in parallel) under `bf16`/`fp16` autocast on GPU/MPS.
-2. **KV Cache & Sliding Context Window**: [`KVCache`](../src/model.py#L107-L142) pre-allocates per-layer Key and Value buffers so each new token only runs through the network once (`T=1`) instead of recomputing all previous tokens. When the generated text reaches `block_size`, the cache cleanly slides and re-prefills the latest `block_size // 2` tokens.
+1. **Evaluation Mode, Autocast & Batched Sampling**: [`sample()`](../src/sample.py#L37-L98) switches to `model.eval()` (disabling dropout, then restoring training mode afterward if needed), wraps generation in `torch.no_grad()` plus `bf16`/`fp16` autocast on GPU/MPS, and expands the prompt across `num_samples` rows so multiple scenes generate **in parallel** in a single pass.
+2. **KV Cache (Prefill + Fast Decode) & Sliding Window**: Without caching, generating token #200 would re-process all 199 earlier tokens from scratch! [`KVCache`](../src/model.py#L107-L142) pre-allocates per-layer Key and Value buffers:
+   - **Prefill**: processes your prompt once (`pos_offset=0`) to populate the cache.
+   - **Decode**: each subsequent step only feeds the **single newest token** (`T = 1`) at `pos_offset = cache_len`, appending its K/V to the buffers instead of recomputing history.
+   - **Sliding window**: once generated text reaches `block_size`, the cache cleanly keeps the most recent `max(block_size // 2, 1)` tokens and re-prefills at `pos_offset=0`, letting you generate arbitrarily long scenes past `block_size`.
 3. **Vocab Padding Mask (`valid_vocab_size`)**: When a model's embedding table is padded up to a clean multiple of 64 for GPU/SIMD speed (e.g., `65 → 128` for char or `50,257 → 50,304` for GPT-2), logits at padded indices are masked to `-inf` so they can never be sampled.
-4. **Temperature (`temperature`, default `0.95`)**: Before softmax, we divide logits (cast to float32 for numerical precision) by `temperature`:
+4. **Temperature (`temperature`, default `0.95`)**: Before softmax, we cast the last-token logits to `float32` for numerical precision and divide by `temperature`:
    - **Low (`0.2`–`0.5`)**: exaggerates differences between scores → confident, conservative, sometimes repetitive.
    - **`1.0`**: samples from the exact learned probabilities.
    - **High (`1.3`–`2.0`)**: flattens probabilities → wilder, more surprising, eventually chaotic gibberish.
-5. **Top-k Filtering (`top_k`, default `200`)**: Keeps only the `k` highest-scoring tokens and sets every other token's logit to `-inf` (probability `0`). This cuts off the "long tail" of bizarre tokens while preserving variety among good candidates.
+5. **Top-k Filtering (`top_k`, default `200`)**: Keeps only the `k` highest-scoring valid tokens and sets every other token's logit to `-inf` (probability `0`). This cuts off the "long tail" of bizarre tokens while preserving variety among good candidates.
    *(Tip: try setting `top_k=5` or `top_k=10` to feel its effect directly, or `top_k=None` to sample from the full vocabulary!)*
 6. **Multinomial Sampling (`torch.multinomial`)**: Rolls a weighted die according to the final probabilities rather than always picking the single top token, so every run creates a unique scene.
 
