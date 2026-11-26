@@ -1,100 +1,67 @@
-import marimo
+from __future__ import annotations
 
-__generated_with = "0.20.4"
-app = marimo.App(width="full", sql_output="native")
+from dataclasses import dataclass
 
-with app.setup:
-    import torch
-    import pickle
-    import tiktoken
-    import marimo as mo
+import torch
+from accelerate import PartialState
 
-    from pathlib import Path, WindowsPath, PosixPath
-    from dataclasses import dataclass
-    from train import initialize_model
-    from hyperparameters import determine_device
-
-    torch.set_float32_matmul_precision('high')
+from hyperparameters import TrainConfig
+from model import GPT
+from tokenizer import load_tokenizer
+from train import load_checkpoint
 
 
-@app.class_definition
 @dataclass
 class SampleConfig:
-    start: str = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-    num_samples: int = 1 # number of samples to draw
-    max_new_tokens: int = 500 # number of tokens generated in each sample
-    temperature: float = 0.95 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-    top_k: int = 200
-    bOverwrite: bool = False
+    start: str = "\n"
+    num_samples: int = 1
+    max_new_tokens: int = 500
+    temperature: float = 0.95
+    top_k: int | None = 200
 
 
-@app.function
-def load_checkpoint(checkpoint_path):
-    device, _ = determine_device()
+def sample(
+    config: TrainConfig,
+    sample_config: SampleConfig,
+    model: GPT | None = None,
+) -> list[str]:
+    """Generate text samples from a saved checkpoint or pre-loaded GPT model."""
+    device = PartialState(cpu=(config.device == "cpu")).device
 
-    torch.serialization.add_safe_globals([WindowsPath, PosixPath])
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    config = checkpoint["config"]
-    model_state_dict = checkpoint["model_state_dict"]
-    optimizer_state_dict = checkpoint["optimizer_state_dict"]
-
-    model, optimizer = initialize_model(config)
-
-    model.load_state_dict(model_state_dict)
-    optimizer.load_state_dict(optimizer_state_dict)
-
-    return config, model, optimizer
-
-
-@app.function
-def sample(config, sample_config):
-    checkpoint_path = config["checkpoint_path"]
-    config, model, _ = load_checkpoint(checkpoint_path)
-
-    meta_path = config["meta_path"]
-    device  = config["device"]
-    compile = config["compile"]
-
-    start = sample_config.start
-    num_samples = sample_config.num_samples
-    max_new_tokens = sample_config.max_new_tokens
-    temperature = sample_config.temperature
-    top_k = sample_config.top_k
-
-    model.eval()
-    model.to(device)
-
-    if meta_path.exists():
-        with open(meta_path, "rb") as f:
-            meta = pickle.load(f)
-
-        encode = meta['encode']
-        decode = meta['decode']
-
-        stoi, itos = meta['stoi'], meta['itos']
-        encode = lambda s: [stoi[c] for c in s]
-        decode = lambda l: ''.join([itos[i] for i in l])
+    if model is None:
+        ckpt_cfg, model = load_checkpoint(config.checkpoint_dir, device=device)
+        meta_path = config.meta_path if config.meta_path.exists() else ckpt_cfg.meta_path
     else:
-        # gpt-2 encodings by default
-        enc = tiktoken.get_encoding("gpt2")
-        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-        decode = lambda l: enc.decode(l)
+        model.to(device)
+        meta_path = config.meta_path if config.meta_path.exists() else None
 
-    # encode the beginning of the prompt
-    if start.startswith("FILE:"):
-        with open(start[5:], "r", encoding="utf-8") as f:
-            start = f.read()
-    start_ids = encode(start)
-    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+    tok_vocab_size, encode, decode = load_tokenizer(meta_path)
+    if tok_vocab_size < 50257 and model.config.vocab_size >= 50257:
+        # Pretrained GPT-2 models expect GPT-2 BPE even if local data/meta.json is char-level.
+        _, encode, decode = load_tokenizer(None)
 
-    # run generation
-    with torch.no_grad():
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+    start_ids = encode(sample_config.start)
+    if not start_ids:
+        raise ValueError("Prompt encoded to zero tokens")
+    x = torch.tensor(start_ids, dtype=torch.long, device=device).unsqueeze(0)
 
-
-if __name__ == "__main__":
-    app.run()
+    outputs: list[str] = []
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for _ in range(sample_config.num_samples):
+                y = model.generate(
+                    x,
+                    sample_config.max_new_tokens,
+                    temperature=sample_config.temperature,
+                    top_k=sample_config.top_k,
+                )
+                text = decode(y[0].tolist())
+                outputs.append(text)
+                print(text)
+                print("---------------")
+    finally:
+        if was_training:
+            model.train()
+    return outputs

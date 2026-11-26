@@ -1,305 +1,270 @@
-import marimo
+from __future__ import annotations
 
-__generated_with = "0.20.4"
-app = marimo.App(width="full", sql_output="native")
+import argparse
+import json
+import math
+import os
+from collections.abc import Iterator
+from pathlib import Path
 
-with app.setup:
-    import math
-    import pickle
-    import torch
-    import marimo as mo
-    from pathlib import Path
-    from model import GPTConfig, GPT
-    from safetensors import safe_open
-    from torch.utils.data import TensorDataset, DataLoader
+import torch
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from safetensors import safe_open
+from safetensors.torch import load_model
+from torch.utils.data import DataLoader, TensorDataset
 
-    torch.set_float32_matmul_precision('high')
-
-
-@app.function
-def get_batch_loader(config, split):
-    batch_size = config["batch_size"]
-    block_size = config["block_size"]
-    device  = config["device"]
-    data_path = config["data_path"]
-
-    file_name = f"{split}.safetensors"
-    file_path = data_path / file_name
-
-    with safe_open(file_path, framework="pt", device=device) as f:
-            # Access tensors by name
-            data = f.get_tensor(split)
-
-    data_length = len(data)
-    quotient = (data_length // block_size)-1
-    truncate_length = block_size * quotient
-    epoch_batches = data_length // (batch_size * block_size)
-
-    x = data[:truncate_length].view(-1, block_size)
-    y = data[1:truncate_length+1].view(-1, block_size)
-
-    dataset = TensorDataset(x, y)
-
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-    return loader, epoch_batches
+from hyperparameters import TrainConfig
+from model import _PRETRAINED_CONFIGS, GPT, GPTConfig
+from tokenizer import download, load_tokenizer, save_tensors, tokenize_char, tokenize_gpt2
 
 
-@app.function
-def get_batch_slice(config, split):
-    batch_size = config["batch_size"]
-    block_size = config["block_size"]
-    device  = config["device"]
-    data_path = config["data_path"]
-    
-    file_name = f"{split}.safetensors"
-    file_path = data_path / file_name
-
-    with safe_open(file_path, framework="pt", device=device) as f:
-        tensor_slice = f.get_slice(split)
-        data = tensor_slice[:batch_size*block_size + 1]
-
-    x = data[:-1].view(batch_size, block_size)
-    y = data[1:].view(batch_size, block_size)
-
-    x, y = x.to(device), y.to(device)
-
-    return x, y
+def build_accelerator(config: TrainConfig) -> Accelerator:
+    """Create Accelerator, honoring accelerate-launch environment overrides."""
+    mixed_precision = None if "ACCELERATE_MIXED_PRECISION" in os.environ else config.mixed_precision
+    dynamo_backend = (
+        None if "ACCELERATE_DYNAMO_BACKEND" in os.environ else ("inductor" if config.compile else None)
+    )
+    return Accelerator(
+        cpu=(config.device == "cpu"),
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        dynamo_backend=dynamo_backend,
+    )
 
 
-@app.function
-def get_batch_random(config, split):
-    block_size = config["block_size"]
-    batch_size = config["batch_size"]
-    device  = config["device"]
-    data_path = config["data_path"]
-
-    file_name = f"{split}.safetensors"
-    file_path = data_path /  file_name
-
-    with safe_open(file_path, framework="pt", device=device) as f:
-        # Access tensors by name
+def build_dataloader(
+    config: TrainConfig,
+    split: str,
+    pin_memory: bool = False,
+    shuffle: bool = True,
+) -> DataLoader:
+    """Load split tokens on CPU and return a DataLoader of (x, y) context windows."""
+    file_path = config.train_path if split == "train" else config.val_path
+    with safe_open(file_path, framework="pt", device="cpu") as f:
         data = f.get_tensor(split)
 
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    n_blocks = (len(data) - 1) // config.block_size
+    if n_blocks < 1:
+        raise ValueError(f"Split {split!r} length ({len(data)}) is too short for block_size={config.block_size}")
 
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+1+block_size] for i in ix])
-
-    x, y = x.to(device), y.to(device)
-
-    return x, y
-
-
-@app.function
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss(config, model):
-    eval_iters = config["eval_iters"]
-
-    out = {}
-    model.eval()
-    for split in ["train", "val"]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch_random(config, split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+    n_tokens = n_blocks * config.block_size
+    x = data[:n_tokens].view(n_blocks, config.block_size)
+    y = data[1 : n_tokens + 1].view(n_blocks, config.block_size)
+    return DataLoader(TensorDataset(x, y), batch_size=config.batch_size, shuffle=shuffle, pin_memory=pin_memory)
 
 
-@app.function
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(config, it):
-    learning_rate = config["learning_rate"]
-    warmup_iters = config["warmup_iters"]
-    lr_decay_iters = config["lr_decay_iters"]
-    min_lr = config["min_lr"]
-
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-
-    return min_lr + coeff * (learning_rate - min_lr)
+def _cycle_batches(loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    epoch = 0
+    while True:
+        if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
+        yield from loader
+        epoch += 1
 
 
-@app.function
-def initialize_model(config):
-    meta_path = config["meta_path"]
-    vocab_size = config["vocab_size"]
-    block_size = config["block_size"]
-    n_layer = config["n_layer"]
-    n_head = config["n_head"]
-    n_embd = config["n_embd"]
-    dropout = config["dropout"]
-    bias = config["bias"]
-    learning_rate = config["learning_rate"]
-    weight_decay = config["weight_decay"]
-    beta1 = config["beta1"]
-    beta2 = config["beta2"]
-    device = config["device"]
-    compile = config["compile"]
-    init_from = config["init_from"]
+def get_lr(config: TrainConfig, step: int) -> float:
+    """Cosine learning rate decay with linear warmup."""
+    if config.warmup_iters > 0 and step < config.warmup_iters:
+        return config.learning_rate * (step + 1) / (config.warmup_iters + 1)
+    if config.lr_decay_iters == 0:
+        return config.learning_rate
+    if step >= config.lr_decay_iters or config.lr_decay_iters <= config.warmup_iters:
+        return config.min_lr
 
-    print("\nInitializing model:")
+    decay_ratio = (step - config.warmup_iters) / (config.lr_decay_iters - config.warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
-    if meta_path.exists():
-        with open(meta_path, "rb") as f:
-            meta = pickle.load(f)
 
-        vocab_size = meta["vocab_size"]
-        print(f"\tLoading vocab size from meta file as {vocab_size}.\n")
+def load_checkpoint(
+    checkpoint_dir: Path,
+    device: str | torch.device = "cpu",
+    dropout: float | None = None,
+) -> tuple[TrainConfig, GPT]:
+    """Load TrainConfig and GPT weights from a safetensors checkpoint directory."""
+    checkpoint_dir = Path(checkpoint_dir)
+    config_file = checkpoint_dir / "config.json"
+    weights_file = checkpoint_dir / "model.safetensors"
+    if not config_file.exists() or not weights_file.exists():
+        raise FileNotFoundError(f"Incomplete checkpoint in {checkpoint_dir}")
 
-    if init_from == 'scratch':
-
-        model_args = dict(
-            vocab_size=vocab_size,
-            block_size=block_size,
-            n_layer=n_layer,
-            n_head=n_head,
-            n_embd=n_embd,
-            bias=bias,
-            dropout=dropout)
-        gptconf = GPTConfig(**model_args)
-        model = GPT(gptconf)
-
-    elif init_from.startswith('gpt2'):
-        # initialize from OpenAI GPT-2 weights
-        print(f"\tLoading weights from GPT-2...")
-
-        override_args = dict(dropout=dropout)
-        model = GPT.from_pretrained(init_from, override_args)
-
-    # # crop down the model block size if desired, using model surgery
-    # if block_size < model.config.block_size:
-    #     model.crop_block_size(block_size)
-
+    cfg = TrainConfig.from_dict(json.loads(config_file.read_text(encoding="utf-8")))
+    if dropout is not None:
+        cfg.dropout = dropout
+    model = GPT(GPTConfig(**cfg.model_kwargs()))
+    missing, unexpected = load_model(model, str(weights_file), device="cpu")
+    if missing or unexpected:
+        raise ValueError(f"Checkpoint mismatch in {checkpoint_dir}: missing={missing}, unexpected={unexpected}")
     model.to(device)
+    return cfg, model
 
-    # Initialize optimizer
-    optimizer = model.configure_optimizers(
-        weight_decay,
-        learning_rate,
-        (beta1, beta2),
-        device)
 
-    # compile the model
-    if compile:
-        print("\tCompiling the model...")
-        model = torch.compile(model) # requires PyTorch 2.0
+def _sync_config_from_model(config: TrainConfig, model: GPT) -> None:
+    config.block_size = model.config.block_size
+    config.vocab_size = model.config.vocab_size
+    config.n_layer = model.config.n_layer
+    config.n_head = model.config.n_head
+    config.n_embd = model.config.n_embd
+    config.bias = model.config.bias
 
+
+def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
+    """Initialize GPT (from scratch, HF GPT-2, or local checkpoint) and AdamW optimizer."""
+    if config.meta_path.exists() and config.init_from == "scratch":
+        config.vocab_size, _, _ = load_tokenizer(config.meta_path)
+
+    if config.init_from == "scratch":
+        model = GPT(GPTConfig(**config.model_kwargs()))
+    elif config.init_from in _PRETRAINED_CONFIGS:
+        model = GPT.from_pretrained(config.init_from, dropout=config.dropout)
+        if config.block_size < model.config.block_size:
+            model.crop_block_size(config.block_size)
+        _sync_config_from_model(config, model)
+    else:
+        ckpt_dir = Path(config.init_from)
+        if not ckpt_dir.is_dir():
+            raise ValueError(f"Unknown init_from value {config.init_from!r}")
+        _, model = load_checkpoint(ckpt_dir, dropout=config.dropout)
+        if config.block_size < model.config.block_size:
+            model.crop_block_size(config.block_size)
+        _sync_config_from_model(config, model)
+
+    optimizer = model.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2))
     return model, optimizer
 
 
-@app.function
-def train_random_batches(config, model, optimizer):
-    max_iters = config["max_iters"]
-    lr_decay_iters = config["lr_decay_iters"]
-    log_iters = config["log_iters"]
+@torch.no_grad()
+def estimate_loss(
+    config: TrainConfig,
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    loaders: dict[str, DataLoader],
+) -> dict[str, float]:
+    """Evaluate mean cross-entropy loss on prepared train and val DataLoaders."""
+    out: dict[str, float] = {}
+    was_training = model.training
+    model.eval()
+    try:
+        for split, loader in loaders.items():
+            batch_losses: list[torch.Tensor] = []
+            for step, (x, y) in enumerate(loader):
+                if step >= config.eval_iters:
+                    break
+                with accelerator.autocast():
+                    _, loss = model(x, y)
+                batch_losses.append(accelerator.reduce(loss.detach(), reduction="mean"))
+            out[split] = float(torch.stack(batch_losses).mean().item()) if batch_losses else float("nan")
+    finally:
+        if was_training:
+            model.train()
+    return out
 
-    # training loop
+
+def train(
+    config: TrainConfig,
+    accelerator: Accelerator | None = None,
+) -> tuple[Accelerator, torch.nn.Module, dict[str, float]]:
+    """Train GPT with Hugging Face Accelerate across CPU, MPS, or single/multi-GPU."""
+    accelerator = accelerator or build_accelerator(config)
+    if config.seed is not None:
+        set_seed(config.seed)
+
+    pin_memory = accelerator.device.type == "cuda"
+    train_loader = build_dataloader(config, "train", pin_memory=pin_memory, shuffle=True)
+    val_loader = build_dataloader(config, "val", pin_memory=pin_memory, shuffle=False)
+
+    model, optimizer = initialize_model(config)
+    accelerator.print(
+        f"\nTraining on {accelerator.device} "
+        f"(mixed_precision={accelerator.mixed_precision}, params={model.get_num_params() / 1e6:.2f}M)"
+    )
+
+    model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
+    epoch_batches = len(train_loader)
+    max_iters = epoch_batches * config.epoch_iters if config.epoch_iters > 0 else config.max_iters
+    accelerator.print(f"\t1 epoch = {epoch_batches} batches; running {max_iters} iterations.")
+
+    losses: dict[str, float] = {}
+    norm = 0.0
+    batch_iter = _cycle_batches(train_loader)
+    model.train()
+
     for iter_num in range(max_iters):
-        # determine and set the learning rate for this iteration
-        if lr_decay_iters > max_iters:
-            lr = get_lr(config, iter_num)
+        x, y = next(batch_iter)
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                _, loss = model(x, y)
+            accelerator.backward(loss)
 
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+            if accelerator.sync_gradients:
+                if config.grad_clip > 0:
+                    norm = float(accelerator.clip_grad_norm_(model.parameters(), config.grad_clip))
+                lr = get_lr(config, iter_num)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
 
-        # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % log_iters == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(config, model)
-            print(f"\tStep {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["validation"]:.4f}")
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        # sample a batch of data
-        X, Y = get_batch_random(config, "train")
+        if iter_num % config.log_iters == 0 or iter_num == max_iters - 1:
+            losses = estimate_loss(config, accelerator, model, {"train": train_loader, "val": val_loader})
+            accelerator.print(
+                f"\tStep {iter_num}: train loss {losses['train']:.4f}, "
+                f"val loss {losses['val']:.4f}, norm {norm:.4f}"
+            )
 
-        # evaluate the loss
-        logits, loss = model(X, Y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-
-@app.function
-def train_sequential_batches(config, model, optimizer):
-    max_iters = config["max_iters"]
-    epoch_iters = config["epoch_iters"]
-    lr_decay_iters = config["lr_decay_iters"]
-    log_iters = config["log_iters"]
-    device  = config["device"]
-
-    loader, epoch_batches = get_batch_loader(config, "train")
-    loader_iter = iter(loader)
-
-    print("\nTraining model:")
-    print(f"\t1 epoch = {epoch_batches} batches")
-
-    if epoch_iters != 0:
-        max_iters = epoch_batches * epoch_iters
-        print(f"\tIterating for {epoch_iters} epoch(es) or {max_iters} iterations.")
-
-    # training loop
-    for iter_num in range(max_iters):
-        if iter_num % epoch_batches == 0 and iter_num != 0:
-            loader, epoch_batches = get_batch_loader(config, "train")
-            loader_iter = iter(loader)
-
-        # sample a batch of data
-        x, y  = next(loader_iter)
-        X, Y = x.to(device), y.to(device)
-
-        # evaluate the loss
-        logits, loss = model(X, Y)
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-
-        # clip the gradient
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-        optimizer.step()
-
-        # determine and set the learning rate for this iteration
-        if lr_decay_iters > max_iters:
-            lr = get_lr(config, iter_num)
-
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
-
-        # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % log_iters == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(config, model)
-            print(f"\tStep {iter_num}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}, norm: {norm:.4f}")
-
-    return losses, norm
+    return accelerator, model, losses
 
 
-@app.function
-def save_checkpoint(config, model, optimizer, losses):
-    checkpoint_path = config["checkpoint_path"]
-    
-    # Save model to checkpoint
-    checkpoint_dict = {
-        "config": config,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "losses": losses,
-    }
+def save_checkpoint(
+    config: TrainConfig,
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    losses: dict[str, float] | None = None,
+) -> Path:
+    """Save unwrapped safetensors weights and JSON config via Accelerate."""
+    unwrapped = accelerator.unwrap_model(model, keep_torch_compile=False)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    accelerator.save_model(unwrapped, config.checkpoint_dir, safe_serialization=True)
+    if accelerator.is_main_process:
+        meta = {**config.to_dict(), "losses": losses or {}}
+        (config.checkpoint_dir / "config.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    accelerator.wait_for_everyone()
+    return config.checkpoint_dir
 
-    torch.save(checkpoint_dict, checkpoint_path)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train Chat Shakespeare with Accelerate")
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None)
+    parser.add_argument("--init-from", default="scratch")
+    parser.add_argument("--tokenizer", choices=("char", "gpt2"), default="char")
+    parser.add_argument("--max-iters", type=int, default=None)
+    parser.add_argument("--data-path", type=Path, default=None)
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+
+    overrides: dict[str, object] = {"init_from": args.init_from}
+    if args.max_iters is not None:
+        overrides["max_iters"] = args.max_iters
+    if args.data_path is not None:
+        overrides["data_path"] = args.data_path
+    config = TrainConfig.auto(device=args.device, **overrides)
+    accelerator = build_accelerator(config)
+
+    if args.overwrite or not config.train_path.exists() or not config.val_path.exists() or not config.meta_path.exists():
+        if accelerator.is_main_process:
+            ds = download(config)
+            tokenized = tokenize_gpt2(config, ds) if args.tokenizer == "gpt2" else tokenize_char(config, ds)
+            save_tensors(config, tokenized)
+        accelerator.wait_for_everyone()
+
+    _, model, losses = train(config, accelerator=accelerator)
+    save_checkpoint(config, accelerator, model, losses)
 
 
 if __name__ == "__main__":
-    app.run()
+    main()
