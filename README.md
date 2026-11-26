@@ -15,8 +15,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--2--Clause-2563EB" alt="BSD-2-Clause License" /></a>
 </p>
 
-- **From-scratch GPT**: Causal self-attention via `F.scaled_dot_product_attention`, fused `AdamW`, and optional pretrained GPT-2 loading directly from Hugging Face `safetensors` (no `transformers` or `pickle`).
-- **Hardware-aware training**: [`TrainConfig.auto()`](src/hyperparameters.py) tunes model size, batching, and precision automatically for CPU (`fp32`), Apple Silicon MPS (`bf16`), and CUDA (`bf16`/`fp16` + `torch.compile`).
+- **From-scratch GPT**: Modern default scratch architecture (`RMSNorm`, RoPE, QK-Norm, `ReLU²`) with `F.scaled_dot_product_attention`, fused `AdamW`, KV-cached batched sampling, and automatic `gpt2` switching when loading pretrained or saved GPT-2 `safetensors` weights (no `transformers` or `pickle`).
+- **Hardware-aware training**: [`TrainConfig.auto()`](src/hyperparameters.py) tunes model size, on-device batching (`TokenBatcher`), precision, and CUDA Graphs (`reduce-overhead`) automatically for CPU (`fp32`), Apple Silicon MPS (`bf16`), and CUDA (`<12GB`, `12–39GB`, and `>=40GB` VRAM tiers).
 
 ## Quickstart
 
@@ -34,13 +34,19 @@ Run interactively with marimo (preferred for local exploration) or from the CLI:
 # Preferred locally: interactive notebook (tokenizes, trains, and samples)
 uv run marimo edit main.py
 
-# Single-machine CLI: applies TrainConfig.auto() precision & compile defaults
+# Single-machine CLI: modern scratch arch, custom BPE tokenizer & hardware defaults
 uv run python src/train.py
+
+# Classic GPT-2 architecture or early stopping on val loss plateau
+uv run python src/train.py --arch gpt2 --early-stopping 3
+
+# Fine-tune pretrained GPT-2 (automatically selects gpt2 arch & tiktoken BPE)
+uv run python src/train.py --init-from gpt2 --lr 3e-4
 
 # Multi-GPU / distributed or custom Accelerate flags
 uv run accelerate launch --multi_gpu --mixed_precision bf16 src/train.py
 uv run accelerate launch --cpu src/train.py
-uv run accelerate launch --mixed_precision bf16 src/train.py --init-from gpt2 --tokenizer gpt2
+uv run accelerate launch --mixed_precision bf16 src/train.py --init-from gpt2
 ```
 
 Run tests:
@@ -59,11 +65,17 @@ uv run python -m unittest discover -s tests
 
 ## Hardware Presets
 
-| Target | Model | Block | Batch × Accum | Precision | Compile |
-| :--- | :--- | ---: | ---: | :--- | :--- |
-| `cpu` | 4L / 4H / 128d (~0.8M) | 128 | 16 × 2 | `no` (`fp32`) | `False` |
-| `mps` | 6L / 6H / 384d (~10.6M) | 256 | 32 × 2 | `bf16` | `False` |
-| `cuda` | 6L / 6H / 384d (~10.6M) | 256 | 64 × 1 (32 × 2 if <12GB) | `bf16` / `fp16` | `True` |
+| Target | Model | Block | Batch × Accum | LR / Beta2 | Precision | Compile |
+| :--- | :--- | ---: | ---: | ---: | :--- | :--- |
+| `cpu` | 4L / 4H / 128d (~0.92M) | 128 | 16 × 2 | `1.5e-3` / `0.99` | `no` (`fp32`) | `False` |
+| `mps` | 6L / 6H / 384d (~11.02M) | 256 | 32 × 2 | `1e-3` / `0.99` | `bf16` | `False` |
+| `cuda` (`<12GB`) | 6L / 6H / 384d (~11.02M) | 256 | 32 × 2 | `1e-3` / `0.99` | `bf16` / `fp16` | `True` (`reduce-overhead`) |
+| `cuda` (`12–39GB`) | 6L / 6H / 384d (~11.02M) | 256 | 64 × 1 | `1e-3` / `0.99` | `bf16` / `fp16` | `True` (`reduce-overhead`) |
+| `cuda` (`>=40GB`) | 6L / 6H / 384d (~11.02M) | 256 | 128 × 1 | `1.4e-3` / `0.95` | `bf16` | `True` (`reduce-overhead`) |
+
+> **Thunder Compute / Cloud GPU Tips:**
+> - Persist `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, and `TORCHINDUCTOR_FX_GRAPH_CACHE=1` on your persistent disk so snapshot restarts skip cold `torch.compile` warmup.
+> - [`uv.lock`](uv.lock) resolves PyTorch `2.15` CUDA 13 (`cu13`) wheels on Linux; if a VM image uses an older CUDA 12 driver, point `[tool.uv.sources]` (marked `sys_platform == 'linux'`) at a matching PyTorch CUDA index.
 
 ---
 

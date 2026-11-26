@@ -104,13 +104,13 @@ Older tutorials often save data with Python's `pickle`. Pickle files can execute
 
 ## Step 2: Training Data (Context Windows and Shifted Targets)
 
-> **Code:** [`build_dataloader`](../src/train.py#L40-L65) in `src/train.py`
+> **Code:** [`TokenBatcher`](../src/train.py#L91-L141) and [`build_dataloader`](../src/train.py#L150-L174) in `src/train.py`
 
 Where do the "right answers" come from if nobody manually labeled Shakespeare?
 
 **The text itself is the answer key!** This is called **self-supervised learning**.
 
-We slice the long list of token IDs into chunks of length `block_size` (also called the **context window** — e.g., 128 characters on CPU or 256 on Apple Silicon / CUDA). For every input chunk `x`, the target `y` is the exact same chunk **shifted right by 1 position**:
+We slice the long list of token IDs into chunks of length `block_size` (also called the **context window** — e.g., 128 tokens on CPU or 256 on Apple Silicon / CUDA). Because Tiny Shakespeare's tokenized splits are only a few megabytes, [`TokenBatcher`](../src/train.py#L91-L141) keeps the 1D token tensor directly on your CPU/MPS/CUDA device and slices random `(B, T)` windows on the fly with zero per-step host-to-device transfers (falling back to [`build_dataloader`](../src/train.py#L150-L174) for datasets over 256 MB). For every input chunk `x`, the target `y` is the exact same chunk **shifted right by 1 position**:
 
 ```text
 Text stream:  F  i  r  s  t     C  i  t  i  z  e  n
@@ -136,14 +136,22 @@ We then group `batch_size` (written `B`) independent chunks together into a 2D t
 
 > **Code:** [`src/model.py`](../src/model.py)
 
-Let's follow a batch of token IDs of shape `(B, T)` as it travels from the front of [`GPT.forward`](../src/model.py#L138-L161) to the final next-token predictions:
+From-scratch training defaults to **`arch="modern"`**, which keeps the classic Transformer block layout while swapping in modern LLM upgrades that train faster and converge cleanly; whenever you load pretrained OpenAI GPT-2 weights (`--init-from gpt2`) or a saved GPT-2 checkpoint, Chat Shakespeare automatically switches to **`arch="gpt2"`**:
+
+| Component | `modern` (default from scratch) | `gpt2` (auto-enabled for GPT-2 weights) |
+| :--- | :--- | :--- |
+| **Position encoding** | **RoPE** (Rotary Position Embeddings on Q/K) | Learned position table (`wpe`) |
+| **Normalization** | **`RMSNorm`** (pre-norm + QK-Norm) | `LayerNorm` |
+| **MLP activation** | **`ReLU²`** (`F.relu(x).square()`) | `GELU` (`approximate="tanh"`) |
+
+Let's follow a batch of token IDs of shape `(B, T)` as it travels from the front of [`GPT.forward`](../src/model.py#L319-L361) to the final next-token predictions:
 
 ```mermaid
 flowchart TD
-    IN["Token IDs idx — shape (B, T)"] --> EMB["Token Embedding (wte) + Positional Embedding (wpe) + Dropout"]
+    IN["Token IDs idx — shape (B, T)"] --> EMB["Token Embedding (wte) [+ wpe for gpt2] + Dropout"]
     EMB --> X0["Hidden Vectors x — shape (B, T, C)"]
-    X0 --> BLK["Transformer Block × n_layer (Pre-LN Attention + Pre-LN MLP)"]
-    BLK --> LNF["Final LayerNorm (ln_f) — shape (B, T, C)"]
+    X0 --> BLK["Transformer Block × n_layer (Pre-Norm Attention [with RoPE + QK-Norm] + Pre-Norm MLP)"]
+    BLK --> LNF["Final Norm (ln_f) — shape (B, T, C)"]
     LNF --> HEAD["Output Linear Head (lm_head, weight-tied with wte)"]
     HEAD --> LOGITS["Logits — shape (B, T, vocab_size)"]
 ```
@@ -152,13 +160,14 @@ flowchart TD
 
 ### 3.1 Embeddings: Meaning and Position
 
-> **Code:** [`Transformer`](../src/model.py#L97-L106)
+> **Code:** [`Transformer`](../src/model.py#L249-L279)
 
 Token ID `42` isn't "greater than" token ID `10` — they are just arbitrary labels. So the very first step converts each integer ID into a **vector** of `n_embd` (e.g., 128 or 384) learnable floating-point numbers:
 
 1. **Token Embedding (`wte`)**: A lookup table of shape `(vocab_size, n_embd)`. Think of each row as a learned list of features describing what that token tends to mean and how it behaves.
-2. **Positional Embedding (`wpe`)**: Attention alone treats inputs like a shuffled bag of tokens (`"dog bites man"` looks identical to `"man bites dog"`). So we also look up a learned vector for each position `0, 1, ..., T-1` from a table of shape `(block_size, n_embd)`.
-3. **Add them together**: `x = drop(wte(idx) + wpe(pos))`.
+2. **Position Information (`RoPE` vs. `wpe`)**: Attention alone treats inputs like a shuffled bag of tokens (`"dog bites man"` looks identical to `"man bites dog"`).
+   - In **`arch="modern"`** (default): instead of adding a learned table at the input, **Rotary Position Embeddings (RoPE)** rotate each Query and Key vector inside attention by an angle proportional to its position so attention naturally sees relative distances.
+   - In **`arch="gpt2"`**: a learned position table (`wpe`) of shape `(block_size, n_embd)` is looked up and added to `wte(idx)`.
 
 Now every token at every position has its own rich vector of size `C = n_embd`, giving tensor shape **`(B, T, C)`**.
 
@@ -166,24 +175,26 @@ Now every token at every position has its own rich vector of size `C = n_embd`, 
 
 ### 3.2 The Transformer Block: Communicate, Then Think
 
-> **Code:** [`Block`](../src/model.py#L84-L94)
+> **Code:** [`Block`](../src/model.py#L228-L246)
 
 The core of GPT is simply a stack of `n_layer` identical **Transformer Blocks** (4 layers on CPU, 6 on MPS/CUDA, 12 on GPT-2 Small). Each block updates every token's vector in two stages:
 
 ```python
-x = x + self.attn(self.ln_1(x))  # 1. Communicate with earlier tokens
+x = x + self.attn(
+    self.ln_1(x), rope=rope, pos_offset=pos_offset, kv_cache=kv_cache
+)  # 1. Communicate
 x = x + self.mlp(self.ln_2(x))  # 2. Think individually about what was gathered
 ```
 
 Think of a group of readers sitting in a row, each holding one character of a sentence:
-1. **Attention (`attn`)** is the **communication step**: each reader asks earlier readers for context (*"Are we inside a character name? Did someone just open a quote? What word started two letters ago?"*).
+1. **Attention (`attn`)** is the **communication step**: each reader asks earlier readers for context (*"Are we inside a character name? Did someone just open a quote? What word started two tokens ago?"*).
 2. **MLP (`mlp`)** is the **thinking step**: each reader privately digests the notes they just collected before passing their updated vector to the next layer.
 
-Repeating this 4 to 6 times lets the network build progressively higher-level understanding—from pairs of letters in early layers, to whole words, to grammar and dramatic dialogue in deeper layers.
+Repeating this 4 to 6 times lets the network build progressively higher-level understanding—from pairs of characters in early layers, to whole words, to grammar and dramatic dialogue in deeper layers.
 
 ### 3.3 Causal Self-Attention: Looking Backward for Context
 
-> **Code:** [`CausalSelfAttention`](../src/model.py#L38-L69)
+> **Code:** [`CausalSelfAttention`](../src/model.py#L141-L211)
 
 Self-attention is the breakthrough idea from *"Attention Is All You Need"*. Here's the intuition:
 
@@ -218,50 +229,50 @@ Instead of doing one big attention lookup over all `n_embd` numbers, we split ea
 - Different heads naturally specialize: one might track the previous 2 characters for spelling, another might track newlines and colons for speaker turns, another might look further back for rhyming or punctuation.
 - Afterward, the heads are stitched back together into `(B, T, C)` and mixed via `c_proj`.
 
-> **PyTorch 2.x Bonus:** [`F.scaled_dot_product_attention(..., is_causal=True)`](../src/model.py#L60-L67) handles the scaling, causal masking, softmax, and dropout in one call — and automatically dispatches to ultra-fast fused kernels (like FlashAttention on CUDA) under the hood.
+> **PyTorch 2.x Bonus:** [`F.scaled_dot_product_attention(..., is_causal=True)`](../src/model.py#L198-L205) handles the scaling, causal masking, softmax, and dropout in one call — and automatically dispatches to ultra-fast fused kernels (like FlashAttention on CUDA) under the hood. In `arch="modern"`, queries and keys also pass through per-head [`RMSNorm`](../src/model.py#L55-L67) (**QK-Norm**) before RoPE rotation so attention logits stay well-scaled at higher learning rates.
 
 ### 3.4 The MLP: Thinking About What Was Gathered
 
-> **Code:** [`MLP`](../src/model.py#L72-L81)
+> **Code:** [`MLP`](../src/model.py#L214-L225)
 
 After attention gathers context across positions, each token independently passes through a two-layer **Multi-Layer Perceptron (MLP)** (also called a Feed-Forward Network):
 
 1. **Expand 4×** (`c_fc`): `n_embd` → `4 * n_embd` (gives the network extra scratchpad space to compute complex feature combinations).
-2. **Activation (`GELU`)**: Applies a smooth nonlinear curve. Without a nonlinearity, stacking linear layers would mathematically collapse into a single matrix multiplication and couldn't learn complex patterns!
+2. **Activation (`ReLU²` or `GELU`)**: Applies a nonlinear curve (`F.relu(x).square()` in `modern`, `GELU(approximate="tanh")` in `gpt2`). Without a nonlinearity, stacking linear layers would mathematically collapse into a single matrix multiplication and couldn't learn complex patterns!
 3. **Compress back** (`c_proj`): `4 * n_embd` → `n_embd`, followed by dropout.
 
-### 3.5 Residual Connections and LayerNorm
+### 3.5 Residual Connections and Normalization (`RMSNorm` / `LayerNorm`)
 
-Look again at those two lines in [`Block.forward`](../src/model.py#L92-L94):
+Look again at those two lines in [`Block.forward`](../src/model.py#L235-L246):
 
 ```python
-x = x + self.attn(self.ln_1(x))
+x = x + self.attn(self.ln_1(x), rope=rope, pos_offset=pos_offset, kv_cache=kv_cache)
 x = x + self.mlp(self.ln_2(x))
 ```
 
 Two quiet engineering ideas here are what make deep Transformers actually trainable:
 
 - **Residual Connections (`x + ...`)**: Instead of overwriting `x`, each layer adds a *refinement* onto `x`. Think of `x` as a clean "information highway" running straight from the input to the output. During backpropagation, gradients can flow directly down that highway without fading away (`vanishing gradients`).
-  *(This is also why [`GPT.__init__`](../src/model.py#L119-L122) scales down the initial weights of every `c_proj` layer by $1 / \sqrt{2 \cdot n_{\text{layer}}}$: it keeps the residual stream from growing wildly as more blocks add onto it.)*
-- **Pre-LayerNorm (`ln_1`, `ln_2`, `ln_f`)**: Before entering attention or the MLP, `LayerNorm` rescales each token vector to mean `0` and variance `1`. That keeps activation values stable and prevents numbers from exploding or shrinking to zero across layers.
+  *(This is also why [`GPT.__init__`](../src/model.py#L292-L295) scales down the initial weights of every `c_proj` layer by $1 / \sqrt{2 \cdot n_{\text{layer}}}$: it keeps the residual stream from growing wildly as more blocks add onto it.)*
+- **Pre-Norm (`ln_1`, `ln_2`, `ln_f`)**: Before entering attention or the MLP, [`RMSNorm`](../src/model.py#L55-L67) (in `modern`) or `LayerNorm` (in `gpt2`) rescales each token vector's magnitude. That keeps activation values stable and prevents numbers from exploding or shrinking to zero across layers.
 
 ### 3.6 Predicting the Next Token and Weight Tying
 
-> **Code:** [`GPT`](../src/model.py#L109-L161)
+> **Code:** [`GPT`](../src/model.py#L282-L361)
 
-After the final Transformer block and final `LayerNorm` (`ln_f`), the **language modeling head (`lm_head`)** projects each token's `n_embd` vector into `vocab_size` raw scores called **logits** — one score for every token in the vocabulary.
+After the final Transformer block and final normalization (`ln_f`), the **language modeling head (`lm_head`)** projects each token's `n_embd` vector into `vocab_size` raw scores called **logits** — one score for every token in the vocabulary.
 
 Two neat details in [`src/model.py`](../src/model.py):
 - **Weight Tying** (`self.transformer.wte.weight = self.lm_head.weight`): The input token embedding table and the final output projection share the **exact same matrix**! Intuitively, if two tokens behave similarly going *in*, they should also occupy similar directions coming *out*. This also cuts down parameter count and improves generalization.
-- **Inference shortcut**: During training (`targets is not None`), we compute logits for all `T` positions. During text generation (`targets is None`), we only run `lm_head` on the very last position `x[:, [-1], :]` because we only need to predict the single next token.
+- **Training & inference fast paths**: During training (`targets is not None` with `return_logits=False`), `GPT.forward` computes cross-entropy loss and returns `(None, loss)` so mixed-precision wrappers never allocate a giant float32 logits tensor. During text generation (`targets is None`), we only run `lm_head` on the very last position `x[:, [-1], :]` and reuse cached keys/values via [`KVCache`](../src/model.py#L105-L138).
 
 ### 3.7 Bonus: Loading Real Pretrained GPT-2 Weights
 
-> **Code:** [`GPT.from_pretrained`](../src/model.py#L174-L229) and [`crop_block_size`](../src/model.py#L163-L172)
+> **Code:** [`GPT.from_pretrained`](../src/model.py#L389-L452) and [`crop_block_size`](../src/model.py#L363-L387)
 
-Even though [`src/model.py`](../src/model.py) is under 280 lines, it is **architecturally identical to OpenAI's GPT-2** (`gpt2`, `gpt2-medium`, `gpt2-large`, `gpt2-xl`). `GPT.from_pretrained("gpt2")` downloads the official `model.safetensors` weights straight from Hugging Face Hub — without even needing the `transformers` library — transposes OpenAI's 4 `Conv1D` matrices to match PyTorch's `nn.Linear`, and loads them directly into our `GPT` class!
+Even though [`src/model.py`](../src/model.py) is compact, switching `arch="gpt2"` makes it **architecturally identical to OpenAI's GPT-2** (`gpt2`, `gpt2-medium`, `gpt2-large`, `gpt2-xl`). `GPT.from_pretrained("gpt2")` downloads the official `model.safetensors` weights straight from Hugging Face Hub — without even needing the `transformers` library — transposes OpenAI's 4 `Conv1D` matrices to match PyTorch's `nn.Linear`, pads the 50,257-row vocabulary cleanly to `50,304`, and loads them directly into our `GPT` class! And both [`TrainConfig.auto`](../src/hyperparameters.py#L467-L536) and [`load_checkpoint`](../src/train.py#L245-L274) automatically switch `arch` to `"gpt2"` whenever GPT-2 weights are detected.
 
-If you want to fine-tune 1024-context GPT-2 with a shorter context window (e.g. `block_size=256`), `crop_block_size` cleanly trims the positional embedding table `wpe` to fit.
+If you want to fine-tune 1024-context GPT-2 with a shorter context window (e.g. `block_size=256`), `crop_block_size` cleanly trims the positional embedding table `wpe` (or RoPE buffers) to fit.
 
 ---
 
@@ -301,23 +312,23 @@ $$\text{Expected initial loss} = -\ln\!\left(\frac{1}{V}\right) = \ln(V)$$
 When you run training, watch **Step 0** in the logs — it will start right around that theoretical baseline! *(Note: raw cross-entropy loss rises with larger vocabularies because each step predicts one of $V$ tokens instead of one character, so compare checkpoints with the same tokenizer—or compare bits per byte across tokenizers.)*
 
 #### Watching for Overfitting
-Every `log_iters` steps, [`estimate_loss`](../src/train.py#L158-L185) evaluates the average loss on both `train` and `val` data:
+Every `log_iters` steps, [`estimate_loss`](../src/train.py#L320-L353) evaluates the average loss on both `train` and `val` data:
 - **Healthy learning**: both `train loss` and `val loss` drop together.
-- **Overfitting**: `train loss` keeps dropping, while `val loss` flattens out or starts **rising** — meaning the model is memorizing the training lines instead of learning general Shakespearean patterns.
+- **Overfitting**: `train loss` keeps dropping, while `val loss` flattens out or starts **rising** — meaning the model is memorizing the training lines instead of learning general Shakespearean patterns. Pass `--early-stopping N` to automatically stop after `N` non-improving evals and restore the best validation checkpoint.
 
 ### 4.2 Backpropagation, AdamW, and Gradient Clipping
 
 - **Backpropagation (`accelerator.backward(loss)`)**: Uses calculus (the chain rule) to compute a **gradient** for every single weight — a number saying *"if you nudge this weight slightly up, does the loss go up or down, and by how much?"*
-- **Gradient Clipping (`grad_clip = 1.0`)**: Occasionally a weird batch produces a giant gradient spike that can derail training. Clipping caps the combined gradient length (printed as `norm` in the training logs) to `1.0` so no single step causes an explosion.
-- **AdamW Optimizer ([`configure_optimizers`](../src/model.py#L231-L245))**: Rather than taking blind fixed-size steps, AdamW tracks:
+- **Gradient Clipping (`grad_clip = 1.0`)**: Occasionally a weird batch produces a giant gradient spike that can derail training. Clipping caps the combined gradient length (printed as `norm` in the training logs) to `1.0` so no single step causes an explosion — and [`train`](../src/train.py#L356-L485) keeps that scalar on-device until `log_iters` so async GPU/MPS queues never stall between log intervals.
+- **AdamW Optimizer ([`configure_optimizers`](../src/model.py#L454-L468))**: Rather than taking blind fixed-size steps, AdamW tracks:
   - **Momentum (`beta1 = 0.9`)**: smooths noisy gradients across steps.
-  - **Adaptive step size (`beta2 = 0.99`)**: automatically takes smaller steps on sensitive parameters and larger steps on quiet ones.
-  - **Weight Decay (`weight_decay = 0.1`)**: gently shrinks 2D weight matrices toward zero every step to discourage memorization (notice how [`configure_optimizers`](../src/model.py#L235-L240) intentionally skips weight decay on 1D biases and LayerNorm parameters!).
+  - **Adaptive step size (`beta2 = 0.99`, or `0.95` on `>=40GB` GPUs)**: automatically takes smaller steps on sensitive parameters and larger steps on quiet ones.
+  - **Weight Decay (`weight_decay = 0.1`)**: gently shrinks 2D weight matrices toward zero every step to discourage memorization (notice how [`configure_optimizers`](../src/model.py#L454-L468) intentionally skips weight decay on 1D biases and norm parameters!).
   - **`fused=True`**: combines all the optimizer math into a single fast kernel.
 
 ### 4.3 Learning Rate Schedule: Warmup and Cosine Decay
 
-> **Code:** [`get_lr`](../src/train.py#L79-L92)
+> **Code:** [`get_lr`](../src/train.py#L229-L242)
 
 The **learning rate (`lr`)** controls how big a step the optimizer takes. Keeping it constant isn't ideal, so this repo uses the industry-standard schedule:
 
@@ -340,20 +351,20 @@ LR
 
 ### 4.4 Hardware Tricks: Mixed Precision, Accumulation, and Accelerate
 
-> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L394-L448) and [`build_accelerator`](../src/train.py#L22-L37)
+> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L467-L536) and [`build_accelerator`](../src/train.py#L55-L88)
 
 Modern LLM training uses a few practical tricks so bigger models run fast on modest hardware — all built right into this repo via [Hugging Face Accelerate](https://huggingface.co/docs/accelerate):
 
-- **Mixed Precision (`bf16` / `fp16` vs. `fp32`)**: Standard floats (`fp32`) use 32 bits per number. Brain Float 16 (`bf16`, used on Apple Silicon macOS 14+ and modern CUDA GPUs) uses half the memory and multiplies much faster, while `accelerator.autocast()` automatically keeps numerically sensitive ops safe.
+- **Mixed Precision (`bf16` / `fp16` vs. `fp32`)**: Standard floats (`fp32`) use 32 bits per number. Brain Float 16 (`bf16`, used on Apple Silicon macOS 14+ and modern CUDA GPUs) uses half the memory and multiplies much faster, while `accelerator.autocast()` automatically keeps numerically sensitive ops safe (plus TF32 matmul precision on CUDA).
 - **Gradient Accumulation (`gradient_accumulation_steps`)**: Larger batches give cleaner gradient estimates, but might not fit in RAM/VRAM. Instead of running one giant batch of 64, we run **2 micro-batches of 32**, add their gradients together inside `with accelerator.accumulate(model):`, and only update the weights once! Same math as batch size 64, half the peak memory.
-- **`torch.compile` (enabled on CUDA)**: Compiles the PyTorch model graph into fused GPU kernels (`inductor`) for extra speed.
-- **One Codebase, Any Hardware**: `Accelerate` lets the exact same [`train()`](../src/train.py#L188-L257) function run on CPU, Apple Silicon (`mps`), a single CUDA GPU, or multiple GPUs (`accelerate launch --multi_gpu`).
+- **On-device batching (`TokenBatcher`) & `torch.compile` (`reduce-overhead`)**: Keeps small datasets resident on-device for zero-copy static `(B, T)` batches and enables CUDA Graphs (`mode="reduce-overhead"`) on CUDA GPUs to minimize kernel launch overhead.
+- **One Codebase, Any Hardware**: `Accelerate` lets the exact same [`train()`](../src/train.py#L356-L485) function run on CPU, Apple Silicon (`mps`), a single CUDA GPU, or multiple GPUs (`accelerate launch --multi_gpu`, with `gradient_as_bucket_view=True` and `bf16` DDP communication hooks on CUDA).
 
 ---
 
 ## Step 5: Sampling (Generating New Shakespeare)
 
-> **Code:** [`src/sample.py`](../src/sample.py) and [`GPT.generate`](../src/model.py#L247-L278)
+> **Code:** [`src/sample.py`](../src/sample.py) and [`GPT.generate`](../src/model.py#L470-L544)
 
 Once weights are saved in `data/checkpoints/<run>/model.safetensors`, generating text is an **autoregressive loop** — the model writes one token at a time and feeds its own output back in as the next input:
 
@@ -365,16 +376,17 @@ Prompt:  "\nROMEO:"
   ... repeats max_new_tokens times!
 ```
 
-### Key Details Inside `GPT.generate`
-1. **Evaluation Mode**: `model.eval()` disables dropout (we want the full model working, not randomly dropping neurons), and `@torch.no_grad()` turns off gradient tracking to save memory and time.
-2. **Sliding Context Window**: Because the model only has positional embeddings up to `block_size`, whenever the generated text grows longer than `block_size`, we pass only the **most recent `block_size` tokens** (`idx[:, -self.config.block_size:]`).
-3. **Temperature (`temperature`, default `0.95`)**: Before softmax, we divide logits by `temperature`:
+### Key Details Inside `GPT.generate` and `sample`
+1. **Evaluation Mode & Autocast**: `model.eval()` disables dropout, `@torch.no_grad()` skips gradient tracking, and [`sample`](../src/sample.py#L24-L93) runs batched generation (`num_samples` in parallel) under `bf16`/`fp16` autocast on GPU/MPS.
+2. **KV Cache & Sliding Context Window**: [`KVCache`](../src/model.py#L105-L138) pre-allocates per-layer Key and Value buffers so each new token only runs through the network once (`T=1`) instead of recomputing all previous tokens. When the generated text reaches `block_size`, the cache cleanly slides and re-prefills the latest `block_size // 2` tokens.
+3. **Vocab Padding Mask (`valid_vocab_size`)**: When a model's embedding table is padded up to a clean multiple of 64 for GPU/SIMD speed (e.g., `65 → 128` for char or `50,257 → 50,304` for GPT-2), logits at padded indices are masked to `-inf` so they can never be sampled.
+4. **Temperature (`temperature`, default `0.95`)**: Before softmax, we divide logits (cast to float32 for numerical precision) by `temperature`:
    - **Low (`0.2`–`0.5`)**: exaggerates differences between scores → confident, conservative, sometimes repetitive.
    - **`1.0`**: samples from the exact learned probabilities.
    - **High (`1.3`–`2.0`)**: flattens probabilities → wilder, more surprising, eventually chaotic gibberish.
-4. **Top-k Filtering (`top_k`, default `200`)**: Keeps only the `k` highest-scoring tokens and sets every other token's logit to `-inf` (probability `0`). This cuts off the "long tail" of bizarre tokens while preserving variety among good candidates.
+5. **Top-k Filtering (`top_k`, default `200`)**: Keeps only the `k` highest-scoring tokens and sets every other token's logit to `-inf` (probability `0`). This cuts off the "long tail" of bizarre tokens while preserving variety among good candidates.
    *(Tip: try setting `top_k=5` or `top_k=10` to feel its effect directly, or `top_k=None` to sample from the full vocabulary!)*
-5. **Multinomial Sampling (`torch.multinomial`)**: Rolls a weighted die according to the final probabilities rather than always picking the single top token, so every run creates a unique scene.
+6. **Multinomial Sampling (`torch.multinomial`)**: Rolls a weighted die according to the final probabilities rather than always picking the single top token, so every run creates a unique scene.
 
 ---
 
@@ -429,34 +441,37 @@ Want to read the entire implementation top to bottom? Here is the gentlest order
 
 | Order | File | Lines | What You'll Learn |
 | :---: | :--- | ---: | :--- |
-| 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 448 | Every knob you can turn, CPU / MPS / CUDA presets, and cache fingerprinting |
-| 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 281 | Downloading Tiny Shakespeare, custom BPE / char / GPT-2 encoding, `safetensors` + JSON storage |
-| 3 | [`src/model.py`](../src/model.py) | 278 | The entire GPT architecture (`CausalSelfAttention`, `MLP`, `Block`, `GPT`, `generate`, `from_pretrained`) |
-| 4 | [`src/train.py`](../src/train.py) | 368 | Shifted `(x, y)` `DataLoader`, cosine LR schedule, `Accelerate` loop, evaluation, checkpointing |
-| 5 | [`src/sample.py`](../src/sample.py) | 70 | Loading a saved checkpoint and sampling text with temperature & top-k |
-| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 536 | End-to-end tests exercising every component on a tiny CPU model in seconds |
+| 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 536 | Every knob you can turn, CPU / MPS / VRAM-tiered CUDA presets, `arch` inference, and cache fingerprinting |
+| 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 277 | Downloading Tiny Shakespeare, custom BPE / char / GPT-2 encoding, `safetensors` + JSON storage |
+| 3 | [`src/model.py`](../src/model.py) | 544 | Both `modern` (`RMSNorm`/RoPE/QK-Norm/`ReLU²`) and `gpt2` architectures, `KVCache`, `generate`, `from_pretrained` |
+| 4 | [`src/train.py`](../src/train.py) | 625 | On-device `TokenBatcher`, cosine LR schedule, `Accelerate` loop, early stopping, checkpointing |
+| 5 | [`src/sample.py`](../src/sample.py) | 93 | Loading a saved checkpoint and batched mixed-precision sampling with vocab masking |
+| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 894 | End-to-end tests exercising every component across CPU and MPS in seconds |
 
 ---
 
 ## Hyperparameter Cheat Sheet
 
-Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py#L166-L199) and [`SampleConfig`](../src/sample.py#L14-L20):
+Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py#L222-L259) and [`SampleConfig`](../src/sample.py#L16-L21):
 
-| Parameter | Plain-English Meaning | Effect of Increasing It |
+| Parameter | Plain-English Meaning | Effect of Increasing / Changing It |
 | :--- | :--- | :--- |
+| `arch` | Block design (`modern` default vs `gpt2`) | `modern` uses RoPE, `RMSNorm`, QK-Norm, `ReLU²`; `gpt2` matches OpenAI GPT-2 |
 | `n_layer` | Number of stacked Transformer blocks | Deeper reasoning capacity; slower & uses more memory |
 | `n_head` | Number of parallel attention heads per block | More specialized attention patterns (`n_embd % n_head == 0`) |
 | `n_embd` | Width of each token's feature vector (`C`) | Richer token representations; parameter count grows ~quadratically |
 | `block_size` | Maximum context window length (`T`) | Longer memory; attention cost grows quadratically with `T` |
-| `vocab_size` | Number of unique tokens in the dictionary | Determined by tokenizer (1,024 default BPE, 65 for char, 50,257/50,304 for GPT-2) |
+| `vocab_size` | Number of unique tokens in the dictionary | Determined by tokenizer (1,024 default BPE, 65→128 char, 50,257→50,304 GPT-2) |
 | `batch_size` | Number of chunks processed simultaneously (`B`) | Smoother gradients & faster throughput; uses more memory |
 | `gradient_accumulation_steps` | Micro-batches summed before one weight update | Simulates a larger effective batch (`batch_size × accum`) without extra VRAM |
 | `dropout` | Fraction of activations randomly zeroed in training | Reduces overfitting; too high makes learning slow/noisy |
 | `learning_rate` / `min_lr` | Peak & final step sizes for AdamW | Too high → loss explodes (`NaN`); too low → learns painfully slowly |
 | `warmup_iters` | Steps to linearly ramp LR from ~0 to peak | Stabilizes early training |
 | `max_iters` | Total training micro-steps to run | More training time; watch `val loss` so you don't overfit |
+| `early_stopping_patience` | Eval rounds without val improvement before stopping | Saves GPU time and restores best validation weights (`0` disables) |
 | `weight_decay` | Shrinkage penalty on 2D weight matrices | Regularizes model against memorization |
 | `grad_clip` | Maximum allowed gradient norm | Prevents sudden training spikes |
 | `mixed_precision` | Number format (`no`/`fp32`, `bf16`, `fp16`) | `bf16`/`fp16` speeds up GPU/MPS training & halves activation memory |
+| `compile` / `compile_mode` | `torch.compile` toggle & Inductor mode | CUDA defaults to `reduce-overhead` (CUDA Graphs) |
 | `temperature` | Creativity dial during generation | Lower = safer/repetitive; higher = diverse/chaotic |
 | `top_k` | Keep only the top `k` most likely next tokens | Lower = fewer weird typos; `None` = sample from full vocabulary |
