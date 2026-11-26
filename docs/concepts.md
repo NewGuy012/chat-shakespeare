@@ -1,6 +1,6 @@
 # How Chat Shakespeare Works: A Beginner's Guide to Building an LLM
 
-Chat Shakespeare is a minimal, from-scratch **GPT (Generative Pre-trained Transformer)** written in ~2,000 lines of readable Python across five modules. It uses the exact same core architecture as GPT-2 and modern Large Language Models (LLMs)—just scaled down so you can train one on your own laptop, inspect every line of code, and learn by experimenting.
+Chat Shakespeare is a minimal, from-scratch **GPT (Generative Pre-trained Transformer)** written in ~2,000 lines of readable Python across five modules in [`src/`](../src). It uses the exact same core architecture as GPT-2 and modern Large Language Models (LLMs) — just scaled down so you can train one on your own laptop, inspect every line of code, and learn by experimenting.
 
 You don't need a PhD or a heavy math background to follow along. If you know basic Python and have heard of arrays (tensors), you're ready.
 
@@ -16,14 +16,15 @@ You don't need a PhD or a heavy math background to follow along. If you know bas
   - [3.2 The Transformer Block: Communicate, Then Think](#32-the-transformer-block-communicate-then-think)
   - [3.3 Causal Self-Attention: Looking Backward for Context](#33-causal-self-attention-looking-backward-for-context)
   - [3.4 The MLP: Thinking About What Was Gathered](#34-the-mlp-thinking-about-what-was-gathered)
-  - [3.5 Residual Connections and LayerNorm](#35-residual-connections-and-layernorm)
+  - [3.5 Residual Connections and Normalization](#35-residual-connections-and-normalization)
   - [3.6 Predicting the Next Token and Weight Tying](#36-predicting-the-next-token-and-weight-tying)
   - [3.7 Bonus: Loading Real Pretrained GPT-2 Weights](#37-bonus-loading-real-pretrained-gpt-2-weights)
 - [Step 4: Training (How the Model Actually Learns)](#step-4-training-how-the-model-actually-learns)
   - [4.1 Cross-Entropy Loss: Measuring Surprise](#41-cross-entropy-loss-measuring-surprise)
   - [4.2 Backpropagation, AdamW, and Gradient Clipping](#42-backpropagation-adamw-and-gradient-clipping)
   - [4.3 Learning Rate Schedule: Warmup and Cosine Decay](#43-learning-rate-schedule-warmup-and-cosine-decay)
-  - [4.4 Hardware Tricks: Mixed Precision, Accumulation, and Accelerate](#44-hardware-tricks-mixed-precision-accumulation-and-accelerate)
+  - [4.4 Hardware Tricks: Presets, Mixed Precision, Accumulation, and Accelerate](#44-hardware-tricks-presets-mixed-precision-accumulation-and-accelerate)
+  - [4.5 Smart Caching and Portable Checkpoints](#45-smart-caching-and-portable-checkpoints)
 - [Step 5: Sampling (Generating New Shakespeare)](#step-5-sampling-generating-new-shakespeare)
 - [Learn by Doing: 6 Hands-On Experiments](#learn-by-doing-6-hands-on-experiments)
 - [Code Reading Map](#code-reading-map)
@@ -35,11 +36,11 @@ You don't need a PhD or a heavy math background to follow along. If you know bas
 
 Under the hood, every GPT-style LLM has one surprisingly simple job:
 
-> **Given some text so far, predict the probability of every possible next piece of text.**
+> **Given some text so far, predict the probability of every possible next piece of text (token).**
 
-That's it! When you feed `"ROMEO:\nO, she doth teach the torches to burn brigh"`, the model outputs a score for every symbol it knows. A well-trained model puts a high probability on `"t"`, and tiny probabilities on `"z"` or `"?"`.
+That's it! When you feed `"ROMEO:\nO, she doth teach the torches to burn "`, the model outputs a score for every token it knows. A well-trained model puts a high probability on `"bright"` (or `"b"` if you choose the character-level tokenizer), and tiny probabilities on `"?"` or `"z"`.
 
-What makes this magical is what emerges as a side effect. To get really good at guessing the next character of Shakespeare, the model *has* to learn:
+What makes this magical is what emerges as a side effect. To get really good at guessing the next token of Shakespeare, the model *has* to learn:
 - Spelling and English words
 - Punctuation and capitalization
 - Play formatting (`CHARACTER NAME:\nDialogue...`)
@@ -58,7 +59,12 @@ flowchart LR
     G --> H["Generated Shakespeare"]
 ```
 
-[`main.py`](../main.py) wires all four stages together inside an interactive [marimo](https://marimo.io) notebook so you can tweak settings and re-run individual steps without waiting for earlier steps to redo work.
+[`main.py`](../main.py) wires all four stages together inside an interactive [marimo](https://marimo.io) notebook across five small cells:
+1. **Configure** — [`TrainConfig.auto()`](../src/hyperparameters.py#L502-L567) picks hardware-aware defaults for your CPU, Apple Silicon, or CUDA GPU.
+2. **Tokenize** — [`prepare_tokens()`](../src/tokenizer.py#L198-L213) downloads and tokenizes Tiny Shakespeare once (reusing the cache on future runs).
+3. **Train** — [`ensure_checkpoint()`](../src/train.py#L482-L497) trains the model and saves a fingerprinted checkpoint (or skips straight to the cache if that config was already trained).
+4. **Load** — [`load_checkpoint()`](../src/train.py#L203-L233) loads the weights into memory in its own cell.
+5. **Sample** — [`sample()`](../src/sample.py#L37-L98) generates new Shakespeare — and because loading is a separate cell, you can tweak `temperature`, `top_k`, or your prompt and re-generate instantly without reloading weights or retraining!
 
 ---
 
@@ -66,52 +72,54 @@ flowchart LR
 
 > **Code:** [`src/tokenizer.py`](../src/tokenizer.py)
 
-Neural networks can only do math on numbers, not letters. A **tokenizer** is the translator between human text and integer IDs:
+Neural networks can only do math on numbers, not text. A **tokenizer** is the translator between human text and integer IDs:
 
-- **`encode(text)`**: `"ROMEO"` → `[30, 27, 25, 17, 27]`
-- **`decode(ids)`**: `[30, 27, 25, 17, 27]` → `"ROMEO"`
+- **`encode(text)`**: converts text into a list of integer token IDs (e.g., subword chunks in BPE, or individual letters in character mode).
+- **`decode(ids)`**: converts those token IDs right back into readable text.
 
 The set of all unique symbols a tokenizer knows is its **vocabulary**, and its size is called `vocab_size`.
 
-Chat Shakespeare includes **three tokenizers** so you can compare subword, character-level, and pretrained tokenization:
+Chat Shakespeare includes **three tokenizers** so you can compare custom subword, character-level, and pretrained tokenization:
 
 | Feature | Custom Byte-Level BPE (`tokenize_bpe`, default) | Character-level (`tokenize_char`) | GPT-2 BPE (`tokenize_gpt2`, via `tiktoken`) |
 | :--- | :--- | :--- | :--- |
-| **Unit** | Learned Shakespeare subwords (`'ROMEO'`, `' the'`, `'ing'`) | Single characters (`'R'`, `'O'`, `'M'`, `'E'`, `'O'`) | General English subword chunks (`'Sh'`, `'akespeare'`) |
-| **`vocab_size`** | **1,024** (configurable via `--vocab-size`) | **65** (every unique character in Tiny Shakespeare) | **50,257** (padded to **50,304** for GPU efficiency) |
+| **Unit** | Learned Shakespeare subwords (`'ROMEO'`, `' the'`, `'ing'`) + `<\|endoftext\|>` | Single characters (`'R'`, `'O'`, `'M'`, `'E'`, `'O'`) | General English subword chunks (`'Sh'`, `'akespeare'`) + `<\|endoftext\|>` |
+| **Tokenizer `vocab_size`** | **1,024** default (`--vocab-size`, min **257**) | **65** (every unique character in Tiny Shakespeare) | **50,257** |
+| **Model embedding size** | **1,024** (padded up to a multiple of 64 if custom) | **128** (`65` padded up to `2 × 64`) | **50,304** (`50,257` padded up to `786 × 64`) |
 | **Sequence length** | Medium (~2.4× compression; `"Shakespeare"` = 7 tokens) | Longest (`"Shakespeare"` = 11 tokens) | Shortest (`"Shakespeare"` = 2 tokens) |
+| **Unknown characters** | Handled cleanly via byte-level fallback | Raises `ValueError` on unseen characters | Handled cleanly via byte-level fallback |
 | **Best for** | Training from scratch (default) | Studying character-by-character learning | Fine-tuning pretrained GPT-2 weights |
 
 ### Why default to a 1,024-token Byte-Level BPE when training from scratch?
-A small BPE vocabulary trained directly on Tiny Shakespeare via Hugging Face `tokenizers` gives you the best of both worlds:
-- **~2.4× longer effective context** inside the same `block_size` window compared to character-level tokens.
-- **No wasted parameters or OOV errors:** Unlike GPT-2's 50,257-token table (where most tokens never appear in Shakespeare), every token in a 1,024-token vocabulary is learned directly from the corpus, and byte-level fallback handles any UTF-8 prompt character cleanly.
+A small Byte-Pair Encoding (BPE) vocabulary trained directly on Tiny Shakespeare via Hugging Face `tokenizers` gives you the best of both worlds:
+- **~2.4× longer effective context** inside the same `block_size` window compared to character-level tokens — the model sees more than twice as much play dialogue at once.
+- **No wasted parameters or OOV errors:** Unlike GPT-2's 50,257-token table (where most tokens never appear in Shakespeare), every token in a 1,024-token vocabulary is learned directly from the corpus, and byte-level fallback (starting from the 256 raw byte values plus `<|endoftext|>`, hence the minimum `bpe_vocab_size = 257`) handles any UTF-8 prompt character cleanly.
 
-> **Why pad 50,257 to 50,304?**  
-> GPUs love numbers divisible by 64 for fast matrix multiplication. `50,304 = 786 × 64` is the next clean multiple of 64 above GPT-2's `50,257` (and `1,024 = 16 × 64` is already a clean multiple of 64!).
+> **Why pad model vocab sizes up to multiples of 64?**  
+> GPUs and modern CPU vector instructions run matrix multiplications fastest when dimensions are clean multiples of 64. [`pad_vocab_size()`](../src/hyperparameters.py#L64-L68) automatically rounds the model's embedding table up (`65 → 128`, `50,257 → 50,304`, while `1,024 = 16 × 64` is already aligned!). During text generation, any padded slots are masked out so the model can never sample a fake token ID.
 
 ### Train Split vs. Validation Split
-[`src/tokenizer.py`](../src/tokenizer.py) caches each tokenizer under `data/tokens/<tokenizer>/` (e.g., `bpe-1024`, `char`, `gpt2` so experiments never overwrite each other) and saves separate split files:
+[`src/tokenizer.py`](../src/tokenizer.py) caches each tokenizer in its own folder under `data/tokens/<tokenizer>/` (e.g., `bpe-1024`, `bpe-512`, `char`, `gpt2` — so switching tokenizers never overwrites earlier work) and saves two split files:
 - `data/tokens/bpe-1024/train.safetensors` — the text the model studies from.
 - `data/tokens/bpe-1024/val.safetensors` — text kept **hidden** from training so we can test whether the model is genuinely learning Shakespearean style or just memorizing the training text.
 
-### Why `safetensors`, JSON, and pinned Hub revisions?
-Older tutorials often save data with Python's `pickle`. Pickle files can execute arbitrary code when loaded (a security hazard) and aren't human-readable. This repo uses:
-- **`.safetensors`** for raw numeric tensors (fast, safe, zero arbitrary code execution, verified via header checks).
-- **`data/tokens/bpe-1024/meta.json`** and **`tokenizer.json`** for tokenizer metadata and learned merges — written atomically so interrupted runs don't corrupt caches.
-- **Pinned Hugging Face Hub revisions** in [`src/tokenizer.py`](../src/tokenizer.py) and [`src/model.py`](../src/model.py) so dataset and pretrained GPT-2 downloads are reproducible.
+### Why `safetensors`, atomic JSON writes, and pinned Hub revisions?
+Older tutorials often save data with Python's `pickle`. Pickle files can execute arbitrary code when loaded (a security hazard) and aren't human-readable. Instead, this repo builds caching with safety and reproducibility in mind:
+- **`.safetensors`** for raw numeric tensors — fast, zero arbitrary code execution, and validated via header checks in [`tokens_ready()`](../src/tokenizer.py#L173-L195).
+- **Atomic writes (`meta.json` last)**: [`tokenize_bpe()`](../src/tokenizer.py#L93-L133), [`tokenize_char()`](../src/tokenizer.py#L77-L90), and [`tokenize_gpt2()`](../src/tokenizer.py#L136-L154) are pure functions; [`save_tokens()`](../src/tokenizer.py#L157-L170) writes each file to a temporary sibling first ([`atomic_path()`](../src/hyperparameters.py#L90-L104)) and writes `meta.json` **last** so a Ctrl+C mid-save can never leave a half-written cache that looks complete. When loading BPE, [`load_tokenizer()`](../src/tokenizer.py#L216-L263) always reads the fixed `tokenizer.json` inside `token_dir` so untrusted metadata can't point outside the cache directory.
+- **Pinned Hugging Face Hub revisions** in [`src/tokenizer.py`](../src/tokenizer.py#L28-L29) (`Trelis/tiny-shakespeare`) and [`src/hyperparameters.py`](../src/hyperparameters.py#L37-L42) (pretrained GPT-2 weights) so downloads are 100% reproducible.
 
 ---
 
 ## Step 2: Training Data (Context Windows and Shifted Targets)
 
-> **Code:** [`TokenBatcher`](../src/train.py#L88-L161) in `src/train.py`
+> **Code:** [`TokenBatcher`](../src/train.py#L88-L161) and [`_build_batcher`](../src/train.py#L164-L184) in `src/train.py`
 
 Where do the "right answers" come from if nobody manually labeled Shakespeare?
 
 **The text itself is the answer key!** This is called **self-supervised learning**.
 
-We slice the long list of token IDs into chunks of length `block_size` (also called the **context window** — e.g., 128 tokens on CPU or 256 on Apple Silicon / CUDA). Because Tiny Shakespeare's tokenized splits are only a few megabytes, [`TokenBatcher`](../src/train.py#L88-L161) keeps 1D token tensors `<= 256 MB` directly on your CPU/MPS/CUDA device and slices random `(B, T)` windows on the fly with zero per-step host-to-device transfers (and keeps splits larger than 256 MB on CPU, transferring only sampled `(B, T)` batches). For every input chunk `x`, the target `y` is the exact same chunk **shifted right by 1 position**:
+We slice the long 1D stream of token IDs into chunks of length `block_size` (also called the **context window** — e.g., 128 tokens on CPU or 256 on Apple Silicon / CUDA). For every input chunk `x`, the target `y` is the exact same chunk **shifted right by 1 position** *(shown with single characters below for readability; with the default BPE tokenizer, each slot holds a subword token instead)*:
 
 ```text
 Text stream:  F  i  r  s  t     C  i  t  i  z  e  n
@@ -130,6 +138,12 @@ Notice how clever this is! One chunk of length `T = 8` doesn't just give the mod
 - Given `First Ci` → predict `t`
 
 We then group `batch_size` (written `B`) independent chunks together into a 2D tensor of shape **`(B, T)`** so the CPU or GPU crunches many windows in parallel.
+
+### Fast, Deterministic Batching with `TokenBatcher`
+Because Tiny Shakespeare's tokenized splits are only a few megabytes, [`TokenBatcher`](../src/train.py#L88-L161) automatically optimizes memory placement:
+- **Small splits (`<= 256 MB`)**: kept directly on your CPU, MPS, or CUDA device so random `(B, T)` batches are gathered on the fly with vectorized indexing (`starts[:, None] + offsets[None, :]`) and zero per-step host-to-device copies.
+- **Large splits (`> 256 MB`)**: kept in CPU RAM, transferring only each sampled `(B, T)` batch (using `non_blocking=True` on CUDA).
+- **Reproducible batches**: each split and distributed worker gets its own seeded `torch.Generator`, and [`iter_eval()`](../src/train.py#L152-L161) resets a fresh seeded generator every evaluation so validation loss comparisons stay apples-to-apples across training steps.
 
 ---
 
