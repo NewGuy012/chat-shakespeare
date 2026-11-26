@@ -16,7 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from hyperparameters import TrainConfig
 from model import GPT, Block, GPTConfig
 from sample import SampleConfig, sample
-from tokenizer import load_tokenizer, save_tensors, tokenize_char, tokenize_gpt2
+from tokenizer import (
+    load_tokenizer,
+    prepare_tokens,
+    save_tensors,
+    tokenize_char,
+    tokenize_gpt2,
+    tokens_ready,
+)
 from train import get_lr, save_checkpoint, train
 
 
@@ -39,10 +46,44 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 encode("?")
 
+            char_meta = cfg.meta_path
             gpt2_tok = tokenize_gpt2(cfg, ds)
             self.assertGreater(len(gpt2_tok["train"]), 0)
+            self.assertTrue(char_meta.exists())
+            self.assertNotEqual(cfg.meta_path, char_meta)
             _, enc_gpt2, dec_gpt2 = load_tokenizer(cfg.meta_path)
             self.assertEqual(dec_gpt2(enc_gpt2("hello world")), "hello world")
+
+    def test_prepare_tokens_caches_by_tokenizer(self) -> None:
+        ds = {"train": {"text": ["hello world\n"]}, "test": {"text": ["hello!\n"]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            char_cfg = TrainConfig.auto("cpu", data_path=Path(tmp))
+            gpt2_cfg = TrainConfig.auto(
+                "cpu", data_path=Path(tmp), init_from="gpt2", block_size=8
+            )
+            with patch("tokenizer.download", return_value=ds) as mock_dl:
+                prepare_tokens(char_cfg)
+                self.assertEqual(mock_dl.call_count, 1)
+                self.assertTrue(tokens_ready(char_cfg))
+
+                # Second call for same tokenizer hits cache without calling download.
+                prepare_tokens(char_cfg)
+                self.assertEqual(mock_dl.call_count, 1)
+
+                # Different tokenizer does not collide and caches separately.
+                prepare_tokens(gpt2_cfg)
+                self.assertEqual(mock_dl.call_count, 2)
+                self.assertTrue(tokens_ready(gpt2_cfg))
+                self.assertTrue(tokens_ready(char_cfg))
+
+                # overwrite=True forces retokenization; corrupted meta invalidates cache.
+                prepare_tokens(char_cfg, overwrite=True)
+                self.assertEqual(mock_dl.call_count, 3)
+                char_cfg.meta_path.write_text('{"tokenizer": "gpt2"}', encoding="utf-8")
+                self.assertFalse(tokens_ready(char_cfg))
+                prepare_tokens(char_cfg)
+                self.assertEqual(mock_dl.call_count, 4)
+                self.assertTrue(tokens_ready(char_cfg))
 
     def test_presets_and_lr_schedule(self) -> None:
         cpu = TrainConfig.auto("cpu", max_iters=200)

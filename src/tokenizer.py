@@ -64,6 +64,7 @@ def tokenize_char(
         raise ValueError("Cannot build character vocabulary from empty dataset")
 
     stoi = {c: i for i, c in enumerate(chars)}
+    config.tokenizer = "char"
     config.vocab_size = len(chars)
     print(f"\nTokenize text (char): vocab_size={config.vocab_size:,}")
 
@@ -96,6 +97,7 @@ def tokenize_gpt2(
         return ids
 
     vocab_size = max(config.vocab_size, enc.n_vocab)
+    config.tokenizer = "gpt2"
     config.vocab_size = vocab_size
     print(f"\nTokenize text (gpt2): vocab_size={vocab_size:,}")
 
@@ -114,13 +116,44 @@ def tokenize_gpt2(
 
 def save_tensors(config: TrainConfig, tokenized: dict[str, list[int]]) -> None:
     """Persist tokenized train and val splits as safetensors."""
-    config.data_path.mkdir(parents=True, exist_ok=True)
+    config.token_dir.mkdir(parents=True, exist_ok=True)
     save_file(
         {"train": torch.tensor(tokenized["train"], dtype=torch.long)}, config.train_path
     )
     save_file(
         {"val": torch.tensor(tokenized["val"], dtype=torch.long)}, config.val_path
     )
+
+
+def tokens_ready(config: TrainConfig) -> bool:
+    """Return True when tokenized splits and matching meta.json exist on disk."""
+    if not (
+        config.train_path.is_file()
+        and config.val_path.is_file()
+        and config.meta_path.is_file()
+    ):
+        return False
+    try:
+        meta = json.loads(config.meta_path.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return False
+    return isinstance(meta, dict) and meta.get("tokenizer") == config.tokenizer
+
+
+def prepare_tokens(config: TrainConfig, overwrite: bool = False) -> Path:
+    """Download and tokenize dataset into config.token_dir unless already cached."""
+    if not overwrite and tokens_ready(config):
+        print(f"Using cached {config.tokenizer} tokens: {config.token_dir}")
+        return config.token_dir
+
+    ds = download(config)
+    tokenized = (
+        tokenize_gpt2(config, ds)
+        if config.tokenizer == "gpt2"
+        else tokenize_char(config, ds)
+    )
+    save_tensors(config, tokenized)
+    return config.token_dir
 
 
 def load_tokenizer(
