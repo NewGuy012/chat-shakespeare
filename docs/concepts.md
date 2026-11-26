@@ -89,20 +89,20 @@ With only 65 possible tokens, the model's lookup tables stay tiny and it sees ev
 > GPUs love numbers divisible by 64 for fast matrix multiplication. `50,304 = 786 × 64` is the next clean multiple of 64 above GPT-2's `50,257`.
 
 ### Train Split vs. Validation Split
-[`src/tokenizer.py`](../src/tokenizer.py) saves two separate files:
-- `data/train.safetensors` — the text the model studies from.
-- `data/val.safetensors` — text kept **hidden** from training so we can test whether the model is genuinely learning Shakespearean style or just memorizing the training text.
+[`src/tokenizer.py`](../src/tokenizer.py) caches each tokenizer under `data/tokens/<tokenizer>/` (so `char` and `gpt2` never overwrite each other) and saves two separate files:
+- `data/tokens/char/train.safetensors` — the text the model studies from.
+- `data/tokens/char/val.safetensors` — text kept **hidden** from training so we can test whether the model is genuinely learning Shakespearean style or just memorizing the training text.
 
 ### Why `safetensors` and `meta.json` instead of `pickle`?
 Older tutorials often save data with Python's `pickle`. Pickle files can execute arbitrary code when loaded (a security hazard) and aren't human-readable. This repo uses:
 - **`.safetensors`** for raw numeric tensors (fast, safe, zero arbitrary code execution).
-- **`data/meta.json`** for tokenizer info — open it after running tokenization to see the exact 65-character alphabet!
+- **`data/tokens/char/meta.json`** for tokenizer info — open it after running tokenization to see the exact 65-character alphabet!
 
 ---
 
 ## Step 2: Training Data (Context Windows and Shifted Targets)
 
-> **Code:** [`build_dataloader`](../src/train.py#L46-L71) in `src/train.py`
+> **Code:** [`build_dataloader`](../src/train.py#L40-L65) in `src/train.py`
 
 Where do the "right answers" come from if nobody manually labeled Shakespeare?
 
@@ -296,7 +296,7 @@ $$\text{Expected initial loss} = -\ln\!\left(\frac{1}{65}\right) = \ln(65) \appr
 When you run training, watch **Step 0** in the logs — it will start right around `4.2`! As training progresses (e.g., 3,000 iterations on Apple Silicon MPS), train loss drops to around `1.14` and validation loss to around `1.50`.
 
 #### Watching for Overfitting
-Every `log_iters` steps, [`estimate_loss`](../src/train.py#L162-L190) evaluates the average loss on both `train` and `val` data:
+Every `log_iters` steps, [`estimate_loss`](../src/train.py#L158-L185) evaluates the average loss on both `train` and `val` data:
 - **Healthy learning**: both `train loss` and `val loss` drop together.
 - **Overfitting**: `train loss` keeps dropping, while `val loss` flattens out or starts **rising** — meaning the model is memorizing the training lines instead of learning general Shakespearean patterns.
 
@@ -312,7 +312,7 @@ Every `log_iters` steps, [`estimate_loss`](../src/train.py#L162-L190) evaluates 
 
 ### 4.3 Learning Rate Schedule: Warmup and Cosine Decay
 
-> **Code:** [`get_lr`](../src/train.py#L85-L98)
+> **Code:** [`get_lr`](../src/train.py#L79-L92)
 
 The **learning rate (`lr`)** controls how big a step the optimizer takes. Keeping it constant isn't ideal, so this repo uses the industry-standard schedule:
 
@@ -335,14 +335,14 @@ LR
 
 ### 4.4 Hardware Tricks: Mixed Precision, Accumulation, and Accelerate
 
-> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L216-L225) and [`build_accelerator`](../src/train.py#L28-L43)
+> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L346-L357) and [`build_accelerator`](../src/train.py#L22-L37)
 
 Modern LLM training uses a few practical tricks so bigger models run fast on modest hardware — all built right into this repo via [Hugging Face Accelerate](https://huggingface.co/docs/accelerate):
 
 - **Mixed Precision (`bf16` / `fp16` vs. `fp32`)**: Standard floats (`fp32`) use 32 bits per number. Brain Float 16 (`bf16`, used on Apple Silicon macOS 14+ and modern CUDA GPUs) uses half the memory and multiplies much faster, while `accelerator.autocast()` automatically keeps numerically sensitive ops safe.
 - **Gradient Accumulation (`gradient_accumulation_steps`)**: Larger batches give cleaner gradient estimates, but might not fit in RAM/VRAM. Instead of running one giant batch of 64, we run **2 micro-batches of 32**, add their gradients together inside `with accelerator.accumulate(model):`, and only update the weights once! Same math as batch size 64, half the peak memory.
 - **`torch.compile` (enabled on CUDA)**: Compiles the PyTorch model graph into fused GPU kernels (`inductor`) for extra speed.
-- **One Codebase, Any Hardware**: `Accelerate` lets the exact same [`train()`](../src/train.py#L193-L262) function run on CPU, Apple Silicon (`mps`), a single CUDA GPU, or multiple GPUs (`accelerate launch --multi_gpu`).
+- **One Codebase, Any Hardware**: `Accelerate` lets the exact same [`train()`](../src/train.py#L188-L257) function run on CPU, Apple Silicon (`mps`), a single CUDA GPU, or multiple GPUs (`accelerate launch --multi_gpu`).
 
 ---
 
@@ -350,7 +350,7 @@ Modern LLM training uses a few practical tricks so bigger models run fast on mod
 
 > **Code:** [`src/sample.py`](../src/sample.py) and [`GPT.generate`](../src/model.py#L247-L278)
 
-Once weights are saved in `data/checkpoint/model.safetensors`, generating text is an **autoregressive loop** — the model writes one token at a time and feeds its own output back in as the next input:
+Once weights are saved in `data/checkpoints/<run>/model.safetensors`, generating text is an **autoregressive loop** — the model writes one token at a time and feeds its own output back in as the next input:
 
 ```text
 Prompt:  "\nROMEO:"
@@ -381,17 +381,17 @@ The best way to understand LLMs is to poke them and watch what breaks or improve
 uv run marimo edit main.py
 ```
 
-*(Remember: set `overwrite = True` in [`main.py`](../main.py) when you want to re-tokenize or re-train after changing `TrainConfig`!)*
+*(Changing `TrainConfig` automatically keys a new cache directory under `data/checkpoints/<run>/` so prior experiments stay preserved; only flip `overwrite_tokens = True` or `overwrite_training = True` in [`main.py`](../main.py) if you want to force rebuilding the same config!)*
 
 ### Experiment 1: Watch Language Emerge Over Time
 Train for just **10**, **200**, and **1,000+** iterations and sample after each run:
 ```bash
-uv run python src/train.py --max-iters 10 --overwrite
+uv run python src/train.py --max-iters 10
 ```
 - **What to watch:** At step 0, loss starts near $\ln(65) \approx 4.17$ and output is alphabet soup. Within a couple hundred steps, spaces, line breaks, and speaker prefixes (`KING:`, `FIRST CITIZEN:`) appear first. Real words and dramatic cadence emerge later!
 
 ### Experiment 2: Feel Temperature and Top-k (No Retraining Needed!)
-In the sampling cell of [`main.py`](../main.py), keep your existing checkpoint and try:
+In the sampling cell of [`main.py`](../main.py), keep your already-loaded in-memory checkpoint and try:
 - `SampleConfig(start="ROMEO:\n", temperature=0.3, top_k=10)` — focused, safe, slightly repetitive.
 - `SampleConfig(start="ROMEO:\n", temperature=0.95, top_k=40)` — natural balance.
 - `SampleConfig(start="ROMEO:\n", temperature=1.8, top_k=None)` — chaotic nonsense!
@@ -406,13 +406,13 @@ Compare `TrainConfig.auto(block_size=16)` vs. `TrainConfig.auto(block_size=256)`
 
 ### Experiment 5: Open the Artifacts on Disk
 After running once, inspect the plain JSON files created in `data/`:
-- `data/meta.json` — see the exact 65-character vocabulary string.
-- `data/checkpoint/config.json` — see every hyperparameter and final train/val losses saved alongside `model.safetensors`.
+- `data/tokens/char/meta.json` — see the exact 65-character vocabulary string.
+- `data/checkpoints/<run>/config.json` — see every hyperparameter, cache fingerprint, and final train/val losses saved alongside `model.safetensors`.
 
 ### Experiment 6: Fine-Tune Real Pretrained GPT-2 on Shakespeare
 Instead of starting from random weights, start from OpenAI's 124M-parameter GPT-2 and fine-tune it on Shakespeare using BPE tokens:
 ```bash
-uv run python src/train.py --init-from gpt2 --tokenizer gpt2 --max-iters 200 --overwrite
+uv run python src/train.py --init-from gpt2 --max-iters 200
 ```
 - **What to watch:** Compare how quickly a pretrained model adapts to Shakespearean English compared to training from scratch!
 
@@ -424,18 +424,18 @@ Want to read the entire implementation top to bottom? Here is the gentlest order
 
 | Order | File | Lines | What You'll Learn |
 | :---: | :--- | ---: | :--- |
-| 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 225 | Every knob you can turn + CPU / MPS / CUDA hardware presets |
-| 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 159 | Downloading Tiny Shakespeare, char vs. GPT-2 BPE encoding, `safetensors` + JSON storage |
+| 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 357 | Every knob you can turn, CPU / MPS / CUDA presets, and cache fingerprinting |
+| 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 192 | Downloading Tiny Shakespeare, char vs. GPT-2 BPE encoding, `safetensors` + JSON storage |
 | 3 | [`src/model.py`](../src/model.py) | 278 | The entire GPT architecture (`CausalSelfAttention`, `MLP`, `Block`, `GPT`, `generate`, `from_pretrained`) |
-| 4 | [`src/train.py`](../src/train.py) | 328 | Shifted `(x, y)` `DataLoader`, cosine LR schedule, `Accelerate` loop, evaluation, checkpointing |
+| 4 | [`src/train.py`](../src/train.py) | 365 | Shifted `(x, y)` `DataLoader`, cosine LR schedule, `Accelerate` loop, evaluation, checkpointing |
 | 5 | [`src/sample.py`](../src/sample.py) | 70 | Loading a saved checkpoint and sampling text with temperature & top-k |
-| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 162 | End-to-end tests exercising every component on a tiny CPU model in seconds |
+| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 406 | End-to-end tests exercising every component on a tiny CPU model in seconds |
 
 ---
 
 ## Hyperparameter Cheat Sheet
 
-Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py#L100-L132) and [`SampleConfig`](../src/sample.py#L14-L20):
+Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py#L153-L185) and [`SampleConfig`](../src/sample.py#L14-L20):
 
 | Parameter | Plain-English Meaning | Effect of Increasing It |
 | :--- | :--- | :--- |
