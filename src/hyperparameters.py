@@ -5,6 +5,8 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -85,20 +87,27 @@ def read_json_dict(path: Path) -> dict[str, Any]:
     return data
 
 
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically write a JSON object via a temporary file and os.replace."""
+@contextmanager
+def atomic_path(path: Path) -> Generator[Path]:
+    """Yield a temporary sibling path and atomically replace ``path`` on success."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
+    os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        yield tmp_path
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write a JSON object to disk."""
+    with atomic_path(path) as tmp:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def read_safetensors_keys(weights_file: Path) -> set[str] | None:
@@ -213,32 +222,11 @@ def _device_preset(target: str) -> dict[str, Any]:
             vram_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024**3)
             bf16 = torch.cuda.is_bf16_supported()
         if 0.0 < vram_gb < 12.0:
-            batch_size, grad_accum, lr, min_lr, beta2, max_iters = (
-                32,
-                2,
-                1e-3,
-                1e-4,
-                0.99,
-                5000,
-            )
+            batch_size, grad_accum, lr, beta2, max_iters = 32, 2, 1e-3, 0.99, 5000
         elif vram_gb >= 40.0:
-            batch_size, grad_accum, lr, min_lr, beta2, max_iters = (
-                128,
-                1,
-                1.4e-3,
-                1.4e-4,
-                0.95,
-                2500,
-            )
+            batch_size, grad_accum, lr, beta2, max_iters = 128, 1, 1.4e-3, 0.95, 2500
         else:
-            batch_size, grad_accum, lr, min_lr, beta2, max_iters = (
-                64,
-                1,
-                1e-3,
-                1e-4,
-                0.99,
-                5000,
-            )
+            batch_size, grad_accum, lr, beta2, max_iters = 64, 1, 1e-3, 0.99, 5000
         return {
             **_GPU_PRESET,
             "device": "cuda",
@@ -248,7 +236,7 @@ def _device_preset(target: str) -> dict[str, Any]:
             "batch_size": batch_size,
             "gradient_accumulation_steps": grad_accum,
             "learning_rate": lr,
-            "min_lr": min_lr,
+            "min_lr": lr * 0.1,
             "beta2": beta2,
             "max_iters": max_iters,
             "lr_decay_iters": max_iters,
@@ -314,31 +302,32 @@ class TrainConfig:
             self.arch = "gpt2"
             self.tokenizer = "gpt2"
 
-        positive_ints = (
-            "batch_size",
-            "block_size",
-            "vocab_size",
-            "bpe_vocab_size",
-            "n_layer",
-            "n_head",
-            "n_embd",
-            "max_iters",
-            "gradient_accumulation_steps",
-            "eval_iters",
-            "log_iters",
+        int_bounds = (
+            (
+                1,
+                (
+                    "batch_size",
+                    "block_size",
+                    "vocab_size",
+                    "bpe_vocab_size",
+                    "n_layer",
+                    "n_head",
+                    "n_embd",
+                    "max_iters",
+                    "gradient_accumulation_steps",
+                    "eval_iters",
+                    "log_iters",
+                ),
+            ),
+            (0, ("warmup_iters", "lr_decay_iters", "early_stopping_patience")),
         )
-        for name in positive_ints:
-            val = getattr(self, name)
-            if not is_int(val) or val < 1:
-                raise ValueError(f"{name} must be an integer >= 1, got {val!r}")
-        for name in (
-            "warmup_iters",
-            "lr_decay_iters",
-            "early_stopping_patience",
-        ):
-            val = getattr(self, name)
-            if not is_int(val) or val < 0:
-                raise ValueError(f"{name} must be an integer >= 0, got {val!r}")
+        for min_val, names in int_bounds:
+            for name in names:
+                val = getattr(self, name)
+                if not is_int(val) or val < min_val:
+                    raise ValueError(
+                        f"{name} must be an integer >= {min_val}, got {val!r}"
+                    )
         if self.seed is not None and not is_int(self.seed):
             raise ValueError(f"seed must be an integer or None, got {self.seed!r}")
 

@@ -17,6 +17,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from hyperparameters import (
     DEFAULT_BPE_VOCAB_SIZE,
     TrainConfig,
+    atomic_path,
     is_int,
     read_json,
     read_json_dict,
@@ -42,19 +43,6 @@ def _split_texts(ds: DatasetDict | dict[str, Any]) -> tuple[list[str], list[str]
     if not any(train_items):
         raise ValueError("Cannot tokenize empty training dataset")
     return train_items, val_items
-
-
-def _save_safetensors_atomic(tensors: dict[str, torch.Tensor], path: Path) -> None:
-    fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    os.close(fd)
-    try:
-        save_file(tensors, tmp_name)
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
 
 
 def download(config: TrainConfig) -> DatasetDict:
@@ -173,23 +161,12 @@ def save_tokens(
     bpe_tokenizer: Tokenizer | None = None,
 ) -> None:
     """Persist tokenized splits, optional BPE tokenizer, and meta.json (written last)."""
-    config.token_dir.mkdir(parents=True, exist_ok=True)
     for split, path in (("train", config.train_path), ("val", config.val_path)):
-        _save_safetensors_atomic(
-            {split: torch.tensor(tokenized[split], dtype=torch.long)}, path
-        )
+        with atomic_path(path) as tmp:
+            save_file({split: torch.tensor(tokenized[split], dtype=torch.long)}, tmp)
     if bpe_tokenizer is not None:
-        tok_path = config.token_dir / _BPE_TOKENIZER_FILE
-        fd, tmp_name = tempfile.mkstemp(
-            dir=config.token_dir, prefix=f".{_BPE_TOKENIZER_FILE}.", suffix=".tmp"
-        )
-        os.close(fd)
-        try:
-            bpe_tokenizer.save(tmp_name)
-            os.replace(tmp_name, tok_path)
-        except BaseException:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
+        with atomic_path(config.token_dir / _BPE_TOKENIZER_FILE) as tmp:
+            bpe_tokenizer.save(str(tmp))
     write_json_atomic(config.meta_path, meta)
 
 

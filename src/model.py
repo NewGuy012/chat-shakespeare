@@ -257,18 +257,14 @@ class Transformer(nn.Module):
             cos, sin = _build_rope_cache(
                 config.block_size, config.n_embd // config.n_head
             )
-            self.register_buffer("pos", None, persistent=False)
-            self.register_buffer("rope_cos", cos, persistent=False)
-            self.register_buffer("rope_sin", sin, persistent=False)
+            pos = None
         else:
             self.wpe = nn.Embedding(config.block_size, config.n_embd)
-            self.register_buffer(
-                "pos",
-                torch.arange(config.block_size, dtype=torch.long),
-                persistent=False,
-            )
-            self.register_buffer("rope_cos", None, persistent=False)
-            self.register_buffer("rope_sin", None, persistent=False)
+            pos = torch.arange(config.block_size, dtype=torch.long)
+            cos = sin = None
+        self.register_buffer("pos", pos, persistent=False)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
         self.drop = nn.Dropout(config.dropout)
         self.h = nn.ModuleList(
             [Block(config, layer_idx=i) for i in range(config.n_layer)]
@@ -430,21 +426,18 @@ class GPT(nn.Module):
             if target_k not in sd:
                 raise ValueError(f"Unexpected pretrained weight key: {k!r}")
             src = tensor.t() if any(k.endswith(w) for w in _CONV1D_WEIGHTS) else tensor
-            if (
-                target_k == "transformer.wte.weight"
-                and src.shape == (GPT2_VOCAB_SIZE, cfg.n_embd)
-                and vocab_size > GPT2_VOCAB_SIZE
+            dst = sd[target_k]
+            if target_k == "transformer.wte.weight" and src.shape == (
+                GPT2_VOCAB_SIZE,
+                cfg.n_embd,
             ):
-                with torch.no_grad():
-                    sd[target_k][:GPT2_VOCAB_SIZE].copy_(src)
-                loaded.add(target_k)
-                continue
-            if src.shape != sd[target_k].shape:
+                dst = dst[:GPT2_VOCAB_SIZE]
+            elif src.shape != dst.shape:
                 raise ValueError(
-                    f"Shape mismatch for {k!r}: {tuple(src.shape)} != {tuple(sd[target_k].shape)}"
+                    f"Shape mismatch for {k!r}: {tuple(src.shape)} != {tuple(dst.shape)}"
                 )
             with torch.no_grad():
-                sd[target_k].copy_(src)
+                dst.copy_(src)
             loaded.add(target_k)
 
         if loaded != expected:
