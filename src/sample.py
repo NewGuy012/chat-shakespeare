@@ -26,11 +26,14 @@ def sample(
     model: GPT | None = None,
 ) -> list[str]:
     """Generate text samples from a saved checkpoint or pre-loaded GPT model."""
-    device = PartialState(cpu=(config.device == "cpu")).device
+    state = PartialState(cpu=(config.device == "cpu"))
+    device = state.device if state.device is not None else state.default_device
 
     if model is None:
         ckpt_cfg, model = load_checkpoint(config.checkpoint_dir, device=device)
-        meta_path = config.meta_path if config.meta_path.exists() else ckpt_cfg.meta_path
+        meta_path = (
+            config.meta_path if config.meta_path.exists() else ckpt_cfg.meta_path
+        )
     else:
         model.to(device)
         meta_path = config.meta_path if config.meta_path.exists() else None

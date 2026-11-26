@@ -38,16 +38,26 @@ def _(checkpoint_dir, config):
 
 @app.function
 def tokenize(config, overwrite=False):
-    ready = config.train_path.exists() and config.val_path.exists() and config.meta_path.exists()
+    ready = (
+        config.train_path.exists()
+        and config.val_path.exists()
+        and config.meta_path.exists()
+    )
     if overwrite or not ready:
         ds = download(config)
-        tokenized = tokenize_gpt2(config, ds) if config.init_from.startswith("gpt2") else tokenize_char(config, ds)
+        tokenized = (
+            tokenize_gpt2(config, ds)
+            if config.init_from.startswith("gpt2")
+            else tokenize_char(config, ds)
+        )
         save_tensors(config, tokenized)
 
 
 @app.function
 def training(config, overwrite=False):
-    ckpt_ready = (config.checkpoint_dir / "model.safetensors").exists() and (config.checkpoint_dir / "config.json").exists()
+    ckpt_ready = (config.checkpoint_dir / "model.safetensors").exists() and (
+        config.checkpoint_dir / "config.json"
+    ).exists()
     if overwrite or not ckpt_ready:
         accelerator, model, losses = train(config)
         save_checkpoint(config, accelerator, model, losses)

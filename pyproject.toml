@@ -15,3 +15,13 @@ dependencies = [
 ]
 [tool.marimo.runtime]
 pythonpath = ["src"]
+
+[tool.ruff.lint.per-file-ignores]
+# Marimo cells use trailing bare expressions for display and trailing `return` to suppress output.
+"main.py" = ["B018", "PLR1711"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.6",
+    "ty>=0.0.112",
+]

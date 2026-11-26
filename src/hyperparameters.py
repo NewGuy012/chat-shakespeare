@@ -22,6 +22,81 @@ def _detect_device() -> str:
     return "cpu"
 
 
+def _device_preset(target: str) -> dict[str, Any]:
+    """Return baseline TrainConfig field values for a validated target device."""
+    if target == "cpu":
+        return {
+            "device": "cpu",
+            "mixed_precision": "no",
+            "compile": False,
+            "n_layer": 4,
+            "n_head": 4,
+            "n_embd": 128,
+            "block_size": 128,
+            "batch_size": 16,
+            "gradient_accumulation_steps": 2,
+            "dropout": 0.1,
+            "learning_rate": 1.5e-3,
+            "min_lr": 1.5e-4,
+            "max_iters": 1000,
+            "warmup_iters": 50,
+            "lr_decay_iters": 1000,
+            "eval_iters": 10,
+            "log_iters": 100,
+        }
+    if target == "mps":
+        mps_bf16 = hasattr(
+            torch.backends.mps, "is_macos_or_newer"
+        ) and torch.backends.mps.is_macos_or_newer(14, 0)
+        return {
+            "device": "mps",
+            "mixed_precision": "bf16" if mps_bf16 else "no",
+            "compile": False,
+            "n_layer": 6,
+            "n_head": 6,
+            "n_embd": 384,
+            "block_size": 256,
+            "batch_size": 32,
+            "gradient_accumulation_steps": 2,
+            "dropout": 0.2,
+            "learning_rate": 1e-3,
+            "min_lr": 1e-4,
+            "max_iters": 3000,
+            "warmup_iters": 100,
+            "lr_decay_iters": 3000,
+            "eval_iters": 20,
+            "log_iters": 250,
+        }
+    if target == "cuda":
+        low_vram = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(0).total_memory < 12 * 1024**3
+        )
+        bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        return {
+            "device": "cuda",
+            "mixed_precision": "bf16" if bf16 else "fp16",
+            "compile": True,
+            "n_layer": 6,
+            "n_head": 6,
+            "n_embd": 384,
+            "block_size": 256,
+            "batch_size": 32 if low_vram else 64,
+            "gradient_accumulation_steps": 2 if low_vram else 1,
+            "dropout": 0.2,
+            "learning_rate": 1e-3,
+            "min_lr": 1e-4,
+            "max_iters": 5000,
+            "warmup_iters": 100,
+            "lr_decay_iters": 5000,
+            "eval_iters": 20,
+            "log_iters": 250,
+        }
+    raise ValueError(
+        f"Unsupported device preset {target!r}; expected one of {sorted(_VALID_DEVICES)}"
+    )
+
+
 @dataclass
 class TrainConfig:
     """Hyperparameters, paths, and Accelerate runtime settings for GPT training."""
@@ -59,13 +134,17 @@ class TrainConfig:
         self.root_path = Path(self.root_path)
         self.data_path = Path(self.data_path)
         if self.device not in _VALID_DEVICES:
-            raise ValueError(f"Unsupported device {self.device!r}; expected one of {sorted(_VALID_DEVICES)}")
+            raise ValueError(
+                f"Unsupported device {self.device!r}; expected one of {sorted(_VALID_DEVICES)}"
+            )
         if self.mixed_precision not in _VALID_PRECISIONS:
             raise ValueError(
                 f"Unsupported mixed_precision {self.mixed_precision!r}; expected one of {sorted(_VALID_PRECISIONS)}"
             )
         if self.n_embd % self.n_head != 0:
-            raise ValueError(f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})")
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
+            )
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
         positive_ints = (
@@ -83,8 +162,15 @@ class TrainConfig:
         for name in positive_ints:
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
-        if self.epoch_iters < 0 or self.warmup_iters < 0 or self.lr_decay_iters < 0 or self.grad_clip < 0:
-            raise ValueError("epoch_iters, warmup_iters, lr_decay_iters, and grad_clip must be >= 0")
+        if (
+            self.epoch_iters < 0
+            or self.warmup_iters < 0
+            or self.lr_decay_iters < 0
+            or self.grad_clip < 0
+        ):
+            raise ValueError(
+                "epoch_iters, warmup_iters, lr_decay_iters, and grad_clip must be >= 0"
+            )
 
     @property
     def meta_path(self) -> Path:
@@ -118,7 +204,9 @@ class TrainConfig:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: str(v) if isinstance(v, Path) else v for k, v in asdict(self).items()}
+        return {
+            k: str(v) if isinstance(v, Path) else v for k, v in asdict(self).items()
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TrainConfig:
@@ -129,71 +217,7 @@ class TrainConfig:
     def auto(cls, device: str | None = None, **overrides: Any) -> TrainConfig:
         """Return empirically tuned defaults for CPU, Apple MPS, or CUDA GPU."""
         target = _detect_device() if device is None else device
-        if target == "cpu":
-            preset: dict[str, Any] = {
-                "device": "cpu",
-                "mixed_precision": "no",
-                "compile": False,
-                "n_layer": 4,
-                "n_head": 4,
-                "n_embd": 128,
-                "block_size": 128,
-                "batch_size": 16,
-                "gradient_accumulation_steps": 2,
-                "dropout": 0.1,
-                "learning_rate": 1.5e-3,
-                "min_lr": 1.5e-4,
-                "max_iters": 1000,
-                "warmup_iters": 50,
-                "lr_decay_iters": 1000,
-                "eval_iters": 10,
-                "log_iters": 100,
-            }
-        elif target == "mps":
-            mps_bf16 = hasattr(torch.backends.mps, "is_macos_or_newer") and torch.backends.mps.is_macos_or_newer(14, 0)
-            preset = {
-                "device": "mps",
-                "mixed_precision": "bf16" if mps_bf16 else "no",
-                "compile": False,
-                "n_layer": 6,
-                "n_head": 6,
-                "n_embd": 384,
-                "block_size": 256,
-                "batch_size": 32,
-                "gradient_accumulation_steps": 2,
-                "dropout": 0.2,
-                "learning_rate": 1e-3,
-                "min_lr": 1e-4,
-                "max_iters": 3000,
-                "warmup_iters": 100,
-                "lr_decay_iters": 3000,
-                "eval_iters": 20,
-                "log_iters": 250,
-            }
-        elif target == "cuda":
-            low_vram = torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 12 * 1024**3
-            bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-            preset = {
-                "device": "cuda",
-                "mixed_precision": "bf16" if bf16 else "fp16",
-                "compile": True,
-                "n_layer": 6,
-                "n_head": 6,
-                "n_embd": 384,
-                "block_size": 256,
-                "batch_size": 32 if low_vram else 64,
-                "gradient_accumulation_steps": 2 if low_vram else 1,
-                "dropout": 0.2,
-                "learning_rate": 1e-3,
-                "min_lr": 1e-4,
-                "max_iters": 5000,
-                "warmup_iters": 100,
-                "lr_decay_iters": 5000,
-                "eval_iters": 20,
-                "log_iters": 250,
-            }
-        else:
-            raise ValueError(f"Unsupported device preset {target!r}; expected one of {sorted(_VALID_DEVICES)}")
+        preset = _device_preset(target)
 
         if "max_iters" in overrides and "lr_decay_iters" not in overrides:
             preset["lr_decay_iters"] = overrides["max_iters"]

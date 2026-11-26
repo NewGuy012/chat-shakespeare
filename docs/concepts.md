@@ -170,7 +170,7 @@ The core of GPT is simply a stack of `n_layer` identical **Transformer Blocks** 
 
 ```python
 x = x + self.attn(self.ln_1(x))  # 1. Communicate with earlier tokens
-x = x + self.mlp(self.ln_2(x))   # 2. Think individually about what was gathered
+x = x + self.mlp(self.ln_2(x))  # 2. Think individually about what was gathered
 ```
 
 Think of a group of readers sitting in a row, each holding one character of a sentence:

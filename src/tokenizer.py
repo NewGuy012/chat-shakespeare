@@ -27,9 +27,18 @@ def _split_texts(ds: DatasetDict | dict[str, Any]) -> tuple[list[str], list[str]
 def download(config: TrainConfig) -> DatasetDict:
     """Download or load cached tiny-shakespeare dataset."""
     if config.download_path.exists():
-        return load_from_disk(config.download_path)
+        loaded = load_from_disk(config.download_path)
+        if not isinstance(loaded, DatasetDict):
+            raise TypeError(
+                f"Expected DatasetDict at {config.download_path}, got {type(loaded).__name__}"
+            )
+        return loaded
 
     dataset = load_dataset("Trelis/tiny-shakespeare")
+    if not isinstance(dataset, DatasetDict):
+        raise TypeError(
+            f"Expected DatasetDict from load_dataset, got {type(dataset).__name__}"
+        )
     if "Text" in dataset["train"].column_names:
         dataset = dataset.rename_column("Text", "text")
     config.download_path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,7 +52,9 @@ def save_meta(config: TrainConfig, meta: dict[str, Any]) -> None:
     config.meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def tokenize_char(config: TrainConfig, ds: DatasetDict | dict[str, Any]) -> dict[str, list[int]]:
+def tokenize_char(
+    config: TrainConfig, ds: DatasetDict | dict[str, Any]
+) -> dict[str, list[int]]:
     """Character-level tokenize train/val splits and persist metadata."""
     train_items, val_items = _split_texts(ds)
     train_text = "".join(train_items)
@@ -70,7 +81,9 @@ def tokenize_char(config: TrainConfig, ds: DatasetDict | dict[str, Any]) -> dict
     }
 
 
-def tokenize_gpt2(config: TrainConfig, ds: DatasetDict | dict[str, Any]) -> dict[str, list[int]]:
+def tokenize_gpt2(
+    config: TrainConfig, ds: DatasetDict | dict[str, Any]
+) -> dict[str, list[int]]:
     """Tokenize train/val splits with GPT-2 BPE (tiktoken) and persist metadata."""
     enc = _gpt2_encoding()
     train_items, val_items = _split_texts(ds)
@@ -102,8 +115,12 @@ def tokenize_gpt2(config: TrainConfig, ds: DatasetDict | dict[str, Any]) -> dict
 def save_tensors(config: TrainConfig, tokenized: dict[str, list[int]]) -> None:
     """Persist tokenized train and val splits as safetensors."""
     config.data_path.mkdir(parents=True, exist_ok=True)
-    save_file({"train": torch.tensor(tokenized["train"], dtype=torch.long)}, config.train_path)
-    save_file({"val": torch.tensor(tokenized["val"], dtype=torch.long)}, config.val_path)
+    save_file(
+        {"train": torch.tensor(tokenized["train"], dtype=torch.long)}, config.train_path
+    )
+    save_file(
+        {"val": torch.tensor(tokenized["val"], dtype=torch.long)}, config.val_path
+    )
 
 
 def load_tokenizer(
@@ -120,7 +137,9 @@ def load_tokenizer(
             def encode_char(text: str) -> list[int]:
                 unknown = sorted({c for c in text if c not in stoi})
                 if unknown:
-                    raise ValueError(f"Unsupported character(s) for char tokenizer: {unknown}")
+                    raise ValueError(
+                        f"Unsupported character(s) for char tokenizer: {unknown}"
+                    )
                 return [stoi[c] for c in text]
 
             def decode_char(ids: list[int]) -> str:

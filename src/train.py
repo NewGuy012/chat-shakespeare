@@ -16,14 +16,24 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from hyperparameters import TrainConfig
 from model import _PRETRAINED_CONFIGS, GPT, GPTConfig
-from tokenizer import download, load_tokenizer, save_tensors, tokenize_char, tokenize_gpt2
+from tokenizer import (
+    download,
+    load_tokenizer,
+    save_tensors,
+    tokenize_char,
+    tokenize_gpt2,
+)
 
 
 def build_accelerator(config: TrainConfig) -> Accelerator:
     """Create Accelerator, honoring accelerate-launch environment overrides."""
-    mixed_precision = None if "ACCELERATE_MIXED_PRECISION" in os.environ else config.mixed_precision
+    mixed_precision = (
+        None if "ACCELERATE_MIXED_PRECISION" in os.environ else config.mixed_precision
+    )
     dynamo_backend = (
-        None if "ACCELERATE_DYNAMO_BACKEND" in os.environ else ("inductor" if config.compile else None)
+        None
+        if "ACCELERATE_DYNAMO_BACKEND" in os.environ
+        else ("inductor" if config.compile else None)
     )
     return Accelerator(
         cpu=(config.device == "cpu"),
@@ -46,19 +56,28 @@ def build_dataloader(
 
     n_blocks = (len(data) - 1) // config.block_size
     if n_blocks < 1:
-        raise ValueError(f"Split {split!r} length ({len(data)}) is too short for block_size={config.block_size}")
+        raise ValueError(
+            f"Split {split!r} length ({len(data)}) is too short for block_size={config.block_size}"
+        )
 
     n_tokens = n_blocks * config.block_size
     x = data[:n_tokens].view(n_blocks, config.block_size)
     y = data[1 : n_tokens + 1].view(n_blocks, config.block_size)
-    return DataLoader(TensorDataset(x, y), batch_size=config.batch_size, shuffle=shuffle, pin_memory=pin_memory)
+    return DataLoader(
+        TensorDataset(x, y),
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        pin_memory=pin_memory,
+    )
 
 
 def _cycle_batches(loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     epoch = 0
     while True:
-        if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
-            loader.sampler.set_epoch(epoch)
+        sampler = getattr(loader, "sampler", None)
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
         yield from loader
         epoch += 1
 
@@ -72,7 +91,9 @@ def get_lr(config: TrainConfig, step: int) -> float:
     if step >= config.lr_decay_iters or config.lr_decay_iters <= config.warmup_iters:
         return config.min_lr
 
-    decay_ratio = (step - config.warmup_iters) / (config.lr_decay_iters - config.warmup_iters)
+    decay_ratio = (step - config.warmup_iters) / (
+        config.lr_decay_iters - config.warmup_iters
+    )
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
@@ -95,7 +116,9 @@ def load_checkpoint(
     model = GPT(GPTConfig(**cfg.model_kwargs()))
     missing, unexpected = load_model(model, str(weights_file), device="cpu")
     if missing or unexpected:
-        raise ValueError(f"Checkpoint mismatch in {checkpoint_dir}: missing={missing}, unexpected={unexpected}")
+        raise ValueError(
+            f"Checkpoint mismatch in {checkpoint_dir}: missing={missing}, unexpected={unexpected}"
+        )
     model.to(device)
     return cfg, model
 
@@ -130,7 +153,9 @@ def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
             model.crop_block_size(config.block_size)
         _sync_config_from_model(config, model)
 
-    optimizer = model.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2))
+    optimizer = model.configure_optimizers(
+        config.weight_decay, config.learning_rate, (config.beta1, config.beta2)
+    )
     return model, optimizer
 
 
@@ -154,7 +179,11 @@ def estimate_loss(
                 with accelerator.autocast():
                     _, loss = model(x, y)
                 batch_losses.append(accelerator.reduce(loss.detach(), reduction="mean"))
-            out[split] = float(torch.stack(batch_losses).mean().item()) if batch_losses else float("nan")
+            out[split] = (
+                float(torch.stack(batch_losses).mean().item())
+                if batch_losses
+                else float("nan")
+            )
     finally:
         if was_training:
             model.train()
@@ -171,7 +200,9 @@ def train(
         set_seed(config.seed)
 
     pin_memory = accelerator.device.type == "cuda"
-    train_loader = build_dataloader(config, "train", pin_memory=pin_memory, shuffle=True)
+    train_loader = build_dataloader(
+        config, "train", pin_memory=pin_memory, shuffle=True
+    )
     val_loader = build_dataloader(config, "val", pin_memory=pin_memory, shuffle=False)
 
     model, optimizer = initialize_model(config)
@@ -180,10 +211,18 @@ def train(
         f"(mixed_precision={accelerator.mixed_precision}, params={model.get_num_params() / 1e6:.2f}M)"
     )
 
-    model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
+    )
     epoch_batches = len(train_loader)
-    max_iters = epoch_batches * config.epoch_iters if config.epoch_iters > 0 else config.max_iters
-    accelerator.print(f"\t1 epoch = {epoch_batches} batches; running {max_iters} iterations.")
+    max_iters = (
+        epoch_batches * config.epoch_iters
+        if config.epoch_iters > 0
+        else config.max_iters
+    )
+    accelerator.print(
+        f"\t1 epoch = {epoch_batches} batches; running {max_iters} iterations."
+    )
 
     losses: dict[str, float] = {}
     norm = 0.0
@@ -199,7 +238,11 @@ def train(
 
             if accelerator.sync_gradients:
                 if config.grad_clip > 0:
-                    norm = float(accelerator.clip_grad_norm_(model.parameters(), config.grad_clip))
+                    norm = float(
+                        accelerator.clip_grad_norm_(
+                            model.parameters(), config.grad_clip
+                        )
+                    )
                 lr = get_lr(config, iter_num)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
@@ -208,7 +251,9 @@ def train(
             optimizer.zero_grad(set_to_none=True)
 
         if iter_num % config.log_iters == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(config, accelerator, model, {"train": train_loader, "val": val_loader})
+            losses = estimate_loss(
+                config, accelerator, model, {"train": train_loader, "val": val_loader}
+            )
             accelerator.print(
                 f"\tStep {iter_num}: train loss {losses['train']:.4f}, "
                 f"val loss {losses['val']:.4f}, norm {norm:.4f}"
@@ -232,13 +277,17 @@ def save_checkpoint(
     accelerator.save_model(unwrapped, config.checkpoint_dir, safe_serialization=True)
     if accelerator.is_main_process:
         meta = {**config.to_dict(), "losses": losses or {}}
-        (config.checkpoint_dir / "config.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        (config.checkpoint_dir / "config.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
     accelerator.wait_for_everyone()
     return config.checkpoint_dir
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Chat Shakespeare with Accelerate")
+    parser = argparse.ArgumentParser(
+        description="Train Chat Shakespeare with Accelerate"
+    )
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None)
     parser.add_argument("--init-from", default="scratch")
     parser.add_argument("--tokenizer", choices=("char", "gpt2"), default="char")
@@ -255,10 +304,19 @@ def main() -> None:
     config = TrainConfig.auto(device=args.device, **overrides)
     accelerator = build_accelerator(config)
 
-    if args.overwrite or not config.train_path.exists() or not config.val_path.exists() or not config.meta_path.exists():
+    if (
+        args.overwrite
+        or not config.train_path.exists()
+        or not config.val_path.exists()
+        or not config.meta_path.exists()
+    ):
         if accelerator.is_main_process:
             ds = download(config)
-            tokenized = tokenize_gpt2(config, ds) if args.tokenizer == "gpt2" else tokenize_char(config, ds)
+            tokenized = (
+                tokenize_gpt2(config, ds)
+                if args.tokenizer == "gpt2"
+                else tokenize_char(config, ds)
+            )
             save_tensors(config, tokenized)
         accelerator.wait_for_everyone()
 
