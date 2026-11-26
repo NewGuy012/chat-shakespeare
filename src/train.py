@@ -24,11 +24,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from hyperparameters import (
     GPT2_VOCAB_SIZE,
+    PRETRAINED_CONFIGS,
     TrainConfig,
     infer_arch_from_weights,
     pad_vocab_size,
 )
-from model import _PRETRAINED_CONFIGS, GPT, GPTConfig
+from model import GPT, GPTConfig
 from tokenizer import load_tokenizer, prepare_tokens
 
 _MAX_DEVICE_TOKENS_BYTES = 256 * 1024 * 1024
@@ -292,7 +293,7 @@ def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
         else:
             config.vocab_size = pad_vocab_size(config.vocab_size, 64)
         model = GPT(GPTConfig(**config.model_kwargs()))
-    elif config.init_from in _PRETRAINED_CONFIGS:
+    elif config.init_from in PRETRAINED_CONFIGS:
         model = GPT.from_pretrained(config.init_from, dropout=config.dropout)
         if config.block_size < model.config.block_size:
             model.crop_block_size(config.block_size)

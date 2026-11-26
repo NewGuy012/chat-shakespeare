@@ -16,7 +16,7 @@ from safetensors.torch import save_file, save_model
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hyperparameters import TrainConfig
-from model import GPT, Block, GPTConfig, KVCache, ReLU2, RMSNorm
+from model import GPT, Block, GPTConfig, KVCache, RMSNorm
 from sample import SampleConfig, sample
 from tokenizer import (
     load_tokenizer,
@@ -310,7 +310,7 @@ class PipelineTests(unittest.TestCase):
             if arch == "modern":
                 self.assertIsNone(model.transformer.wpe)
                 self.assertIsInstance(block0.ln_1, RMSNorm)
-                self.assertIsInstance(block0.mlp.act, ReLU2)
+                self.assertTrue(block0.mlp._modern)
                 self.assertIsNotNone(block0.attn.q_norm)
             else:
                 self.assertIsNotNone(model.transformer.wpe)
@@ -351,7 +351,7 @@ class PipelineTests(unittest.TestCase):
         tiny_spec = {"gpt2": {"n_layer": 1, "n_head": 2, "n_embd": 8}}
         with (
             tempfile.TemporaryDirectory() as tmp,
-            patch("model._PRETRAINED_CONFIGS", tiny_spec),
+            patch("model.PRETRAINED_CONFIGS", tiny_spec),
         ):
             raw_sd = {
                 "wte.weight": torch.randn(50257, 8),

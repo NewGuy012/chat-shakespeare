@@ -10,14 +10,17 @@ from safetensors.torch import load_file
 from torch import nn
 from torch.nn import functional as F
 
-from hyperparameters import VALID_ARCHS, pad_vocab_size
+from hyperparameters import (
+    GPT2_VOCAB_SIZE,
+    PRETRAINED_BLOCK_SIZE,
+    PRETRAINED_CONFIGS,
+    PRETRAINED_REVISIONS,
+    VALID_ARCHS,
+    VOCAB_ALIGN,
+    is_int,
+    pad_vocab_size,
+)
 
-_PRETRAINED_CONFIGS: dict[str, dict[str, int]] = {
-    "gpt2": {"n_layer": 12, "n_head": 12, "n_embd": 768},
-    "gpt2-medium": {"n_layer": 24, "n_head": 16, "n_embd": 1024},
-    "gpt2-large": {"n_layer": 36, "n_head": 20, "n_embd": 1280},
-    "gpt2-xl": {"n_layer": 48, "n_head": 25, "n_embd": 1600},
-}
 _CONV1D_WEIGHTS = (
     "attn.c_attn.weight",
     "attn.c_proj.weight",
@@ -28,7 +31,7 @@ _CONV1D_WEIGHTS = (
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = PRETRAINED_BLOCK_SIZE
     vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
@@ -42,6 +45,12 @@ class GPTConfig:
             raise ValueError(
                 f"Unsupported arch {self.arch!r}; expected one of {sorted(VALID_ARCHS)}"
             )
+        for name in ("block_size", "vocab_size", "n_layer", "n_head", "n_embd"):
+            val = getattr(self, name)
+            if not is_int(val) or val < 1:
+                raise ValueError(f"{name} must be an integer >= 1, got {val!r}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
         if self.n_embd % self.n_head != 0:
             raise ValueError(
                 f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
@@ -53,7 +62,7 @@ class GPTConfig:
 
 
 class RMSNorm(nn.Module):
-    """RMS normalization that casts scale weights to match autocast activation dtype."""
+    """RMS normalization casting weight to activation dtype under autocast."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -65,13 +74,6 @@ class RMSNorm(nn.Module):
         return F.rms_norm(
             x, self.normalized_shape, self.weight.to(dtype=x.dtype), self.eps
         )
-
-
-class ReLU2(nn.Module):
-    """Squared ReLU activation."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.relu(x).square()
 
 
 def _build_rope_cache(
@@ -97,9 +99,9 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 def _make_norm(config: GPTConfig, dim: int) -> nn.Module:
-    if config.arch == "modern":
-        return RMSNorm(dim)
-    return nn.LayerNorm(dim, bias=config.bias)
+    return (
+        RMSNorm(dim) if config.arch == "modern" else nn.LayerNorm(dim, bias=config.bias)
+    )
 
 
 class KVCache:
@@ -113,22 +115,24 @@ class KVCache:
     def update(
         self, layer_idx: int, k: torch.Tensor, v: torch.Tensor, pos_offset: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if pos_offset < 0:
+            raise ValueError(f"pos_offset must be >= 0, got {pos_offset}")
         bsz, n_head, seq_len, head_dim = k.size()
         end_pos = pos_offset + seq_len
         if end_pos > self.max_seq_len:
             raise ValueError(
                 f"KV cache length {end_pos} exceeds max_seq_len {self.max_seq_len}"
             )
+        shape = (bsz, n_head, self.max_seq_len, head_dim)
         k_buf = self.keys[layer_idx]
         v_buf = self.values[layer_idx]
         if (
             k_buf is None
             or v_buf is None
-            or k_buf.size(0) != bsz
+            or k_buf.shape != shape
             or k_buf.dtype != k.dtype
             or k_buf.device != k.device
         ):
-            shape = (bsz, n_head, self.max_seq_len, head_dim)
             k_buf = torch.empty(shape, dtype=k.dtype, device=k.device)
             v_buf = torch.empty(shape, dtype=v.dtype, device=v.device)
             self.keys[layer_idx] = k_buf
@@ -141,10 +145,6 @@ class KVCache:
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig, layer_idx: int = 0) -> None:
         super().__init__()
-        if config.n_embd % config.n_head != 0:
-            raise ValueError(
-                f"n_embd ({config.n_embd}) must be divisible by n_head ({config.n_head})"
-            )
         head_dim = config.n_embd // config.n_head
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -182,21 +182,17 @@ class CausalSelfAttention(nn.Module):
             q = _apply_rope(q, cos, sin)
             k = _apply_rope(k, cos, sin)
 
+        attn_mask: torch.Tensor | None = None
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, k, v, pos_offset)
-            if pos_offset == 0:
-                attn_mask = None
-                is_causal = T > 1
-            elif T == 1:
-                attn_mask = None
-                is_causal = False
-            else:
+            if pos_offset > 0 and T > 1:
                 attn_mask = torch.ones(
                     T, k.size(2), dtype=torch.bool, device=x.device
                 ).tril(diagonal=pos_offset)
                 is_causal = False
+            else:
+                is_causal = T > 1
         else:
-            attn_mask = None
             is_causal = True
 
         y = F.scaled_dot_product_attention(
@@ -215,14 +211,14 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.act: nn.Module = (
-            ReLU2() if config.arch == "modern" else nn.GELU(approximate="tanh")
-        )
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self._modern = config.arch == "modern"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.c_proj(self.act(self.c_fc(x))))
+        h = self.c_fc(x)
+        h = F.relu(h).square() if self._modern else F.gelu(h, approximate="tanh")
+        return self.dropout(self.c_proj(h))
 
 
 class Block(nn.Module):
@@ -258,8 +254,9 @@ class Transformer(nn.Module):
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         if config.arch == "modern":
             self.wpe: nn.Embedding | None = None
-            head_dim = config.n_embd // config.n_head
-            cos, sin = _build_rope_cache(config.block_size, head_dim)
+            cos, sin = _build_rope_cache(
+                config.block_size, config.n_embd // config.n_head
+            )
             self.register_buffer("pos", None, persistent=False)
             self.register_buffer("rope_cos", cos, persistent=False)
             self.register_buffer("rope_sin", sin, persistent=False)
@@ -285,7 +282,7 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = Transformer(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Weight tying shares token embedding and output projection weights.
+        # Share token embedding and output projection weights.
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
@@ -318,22 +315,15 @@ class GPT(nn.Module):
         return_logits: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         _, t = idx.size()
-        if pos_offset + t > self.config.block_size:
+        if pos_offset < 0 or pos_offset + t > self.config.block_size:
             raise ValueError(
-                f"Sequence length {pos_offset + t} exceeds block_size {self.config.block_size}"
+                f"Position range [{pos_offset}, {pos_offset + t}) exceeds block_size {self.config.block_size}"
             )
 
         tok_emb = self.transformer.wte(idx)
         rope: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self.transformer.wpe is not None:
-            pos_buf = self.transformer.pos
-            pos = (
-                pos_buf[pos_offset : pos_offset + t]
-                if pos_buf is not None
-                else torch.arange(
-                    pos_offset, pos_offset + t, dtype=torch.long, device=idx.device
-                )
-            )
+        if self.transformer.wpe is not None and self.transformer.pos is not None:
+            pos = self.transformer.pos[pos_offset : pos_offset + t]
             x = self.transformer.drop(tok_emb + self.transformer.wpe(pos))
         else:
             x = self.transformer.drop(tok_emb)
@@ -365,6 +355,7 @@ class GPT(nn.Module):
             )
         self.config.block_size = block_size
         if self.transformer.wpe is not None:
+            self.transformer.wpe.num_embeddings = block_size
             self.transformer.wpe.weight = nn.Parameter(
                 self.transformer.wpe.weight[:block_size]
             )
@@ -389,32 +380,32 @@ class GPT(nn.Module):
         model_type: str,
         dropout: float = 0.0,
         weights_path: str | Path | None = None,
-        pad_vocab_to: int | None = 64,
+        pad_vocab_to: int | None = VOCAB_ALIGN,
+        revision: str | None = None,
     ) -> GPT:
         """Load OpenAI GPT-2 safetensors weights from Hugging Face Hub or a local file."""
-        if model_type not in _PRETRAINED_CONFIGS:
+        if model_type not in PRETRAINED_CONFIGS:
             raise ValueError(
-                f"Unknown pretrained model {model_type!r}; choose from {sorted(_PRETRAINED_CONFIGS)}"
+                f"Unknown pretrained model {model_type!r}; choose from {sorted(PRETRAINED_CONFIGS)}"
             )
 
-        raw_vocab_size = 50257
         vocab_size = (
-            pad_vocab_size(raw_vocab_size, pad_vocab_to)
+            pad_vocab_size(GPT2_VOCAB_SIZE, pad_vocab_to)
             if pad_vocab_to
-            else raw_vocab_size
+            else GPT2_VOCAB_SIZE
         )
         cfg = GPTConfig(
-            **_PRETRAINED_CONFIGS[model_type],
+            **PRETRAINED_CONFIGS[model_type],
             vocab_size=vocab_size,
-            block_size=1024,
+            block_size=PRETRAINED_BLOCK_SIZE,
             bias=True,
             dropout=dropout,
             arch="gpt2",
         )
         model = cls(cfg)
-        if vocab_size > raw_vocab_size:
+        if vocab_size > GPT2_VOCAB_SIZE:
             with torch.no_grad():
-                model.transformer.wte.weight[raw_vocab_size:].zero_()
+                model.transformer.wte.weight[GPT2_VOCAB_SIZE:].zero_()
         sd = model.state_dict()
 
         resolved = (
@@ -424,6 +415,7 @@ class GPT(nn.Module):
                 hf_hub_download(
                     repo_id=f"openai-community/{model_type}",
                     filename="model.safetensors",
+                    revision=revision or PRETRAINED_REVISIONS.get(model_type),
                 )
             )
         )
@@ -440,11 +432,11 @@ class GPT(nn.Module):
             src = tensor.t() if any(k.endswith(w) for w in _CONV1D_WEIGHTS) else tensor
             if (
                 target_k == "transformer.wte.weight"
-                and src.shape == (raw_vocab_size, cfg.n_embd)
-                and vocab_size > raw_vocab_size
+                and src.shape == (GPT2_VOCAB_SIZE, cfg.n_embd)
+                and vocab_size > GPT2_VOCAB_SIZE
             ):
                 with torch.no_grad():
-                    sd[target_k][:raw_vocab_size].copy_(src)
+                    sd[target_k][:GPT2_VOCAB_SIZE].copy_(src)
                 loaded.add(target_k)
                 continue
             if src.shape != sd[target_k].shape:
@@ -464,16 +456,15 @@ class GPT(nn.Module):
         self, weight_decay: float, learning_rate: float, betas: tuple[float, float]
     ) -> torch.optim.AdamW:
         params = [p for p in self.parameters() if p.requires_grad]
-        decay_params = [p for p in params if p.dim() >= 2]
-        nodecay_params = [p for p in params if p.dim() < 2]
         optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
+            {
+                "params": [p for p in params if p.dim() >= 2],
+                "weight_decay": weight_decay,
+            },
+            {"params": [p for p in params if p.dim() < 2], "weight_decay": 0.0},
         ]
-        device_type = params[0].device.type if params else "cpu"
-        use_fused = device_type in {"cuda", "mps", "cpu"}
         return torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas, fused=use_fused
+            optim_groups, lr=learning_rate, betas=betas, fused=True
         )
 
     @torch.no_grad()
@@ -493,6 +484,10 @@ class GPT(nn.Module):
             raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {temperature}")
+        if top_k is not None and top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+        if valid_vocab_size is not None and valid_vocab_size < 1:
+            raise ValueError(f"valid_vocab_size must be >= 1, got {valid_vocab_size}")
         if max_new_tokens == 0:
             return idx
 
@@ -511,20 +506,18 @@ class GPT(nn.Module):
         )
 
         def sample_next(logits: torch.Tensor | None) -> torch.Tensor:
-            assert logits is not None
+            if logits is None:
+                raise RuntimeError("Expected logits during generation")
             scaled = logits[:, -1, :].float() / temperature
             if valid_limit < scaled.size(-1):
                 scaled[:, valid_limit:] = -float("inf")
             if top_k is not None:
                 k = min(top_k, valid_limit)
-                if k > 0:
-                    v, _ = torch.topk(scaled, k)
-                    scaled[scaled < v[:, [-1]]] = -float("inf")
-            probs = F.softmax(scaled, dim=-1)
-            return torch.multinomial(probs, num_samples=1)
+                v, _ = torch.topk(scaled, k)
+                scaled[scaled < v[:, [-1]]] = -float("inf")
+            return torch.multinomial(F.softmax(scaled, dim=-1), num_samples=1)
 
-        ctx_start = max(0, prompt_len - block_size)
-        ctx = out[:, ctx_start:prompt_len]
+        ctx = out[:, max(0, prompt_len - block_size) : prompt_len]
         logits, _ = self(ctx, pos_offset=0, kv_cache=kv_cache)
         cache_len = ctx.size(1)
         out[:, prompt_len] = sample_next(logits).squeeze(-1)
@@ -533,12 +526,18 @@ class GPT(nn.Module):
         for step in range(1, max_new_tokens):
             cur_end = prompt_len + step
             if cache_len < block_size:
-                tok_in = out[:, cur_end - 1 : cur_end]
-                logits, _ = self(tok_in, pos_offset=cache_len, kv_cache=kv_cache)
+                logits, _ = self(
+                    out[:, cur_end - 1 : cur_end],
+                    pos_offset=cache_len,
+                    kv_cache=kv_cache,
+                )
                 cache_len += 1
             else:
-                ctx = out[:, cur_end - slide_keep : cur_end]
-                logits, _ = self(ctx, pos_offset=0, kv_cache=kv_cache)
+                logits, _ = self(
+                    out[:, cur_end - slide_keep : cur_end],
+                    pos_offset=0,
+                    kv_cache=kv_cache,
+                )
                 cache_len = slide_keep
             out[:, cur_end] = sample_next(logits).squeeze(-1)
         return out
