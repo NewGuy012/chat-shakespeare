@@ -12,7 +12,7 @@ from datasets import DatasetDict, load_dataset, load_from_disk
 from safetensors.torch import save_file
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from hyperparameters import _DEFAULT_GPT2_VOCAB_SIZE, TrainConfig
+from hyperparameters import DEFAULT_GPT2_VOCAB_SIZE, TrainConfig
 
 _EOT_TOKEN = "<|endoftext|>"
 _BPE_TOKENIZER_FILE = "tokenizer.json"
@@ -159,7 +159,7 @@ def tokenize_gpt2(
     vocab_size = (
         config.vocab_size
         if config.vocab_size >= enc.n_vocab
-        else _DEFAULT_GPT2_VOCAB_SIZE
+        else DEFAULT_GPT2_VOCAB_SIZE
     )
     config.tokenizer = "gpt2"
     config.vocab_size = vocab_size

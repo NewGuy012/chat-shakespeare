@@ -23,9 +23,9 @@ from safetensors.torch import load_model
 from torch.utils.data import DataLoader, TensorDataset
 
 from hyperparameters import (
-    _GPT2_MIN_VOCAB_SIZE,
+    GPT2_VOCAB_SIZE,
     TrainConfig,
-    _read_safetensors_keys,
+    infer_arch_from_weights,
     pad_vocab_size,
 )
 from model import _PRETRAINED_CONFIGS, GPT, GPTConfig
@@ -255,13 +255,9 @@ def load_checkpoint(
         raise FileNotFoundError(f"Incomplete checkpoint in {checkpoint_dir}")
 
     cfg = TrainConfig.from_dict(json.loads(config_file.read_text(encoding="utf-8")))
-    keys = _read_safetensors_keys(weights_file)
-    if keys is not None:
-        cfg.arch = (
-            "gpt2"
-            if ("transformer.wpe.weight" in keys or "wpe.weight" in keys)
-            else "modern"
-        )
+    arch = infer_arch_from_weights(weights_file)
+    if arch is not None:
+        cfg.arch = arch
     if dropout is not None:
         cfg.dropout = dropout
     model = GPT(GPTConfig(**cfg.model_kwargs()))
@@ -291,7 +287,7 @@ def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
             tok_vocab, _, _ = load_tokenizer(config.meta_path)
             config.vocab_size = pad_vocab_size(tok_vocab, 64)
         elif config.tokenizer == "gpt2":
-            base_vocab = max(config.vocab_size, _GPT2_MIN_VOCAB_SIZE)
+            base_vocab = max(config.vocab_size, GPT2_VOCAB_SIZE)
             config.vocab_size = pad_vocab_size(base_vocab, 64)
         else:
             config.vocab_size = pad_vocab_size(config.vocab_size, 64)

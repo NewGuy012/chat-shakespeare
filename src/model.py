@@ -10,7 +10,7 @@ from safetensors.torch import load_file
 from torch import nn
 from torch.nn import functional as F
 
-from hyperparameters import _VALID_ARCHS, pad_vocab_size
+from hyperparameters import VALID_ARCHS, pad_vocab_size
 
 _PRETRAINED_CONFIGS: dict[str, dict[str, int]] = {
     "gpt2": {"n_layer": 12, "n_head": 12, "n_embd": 768},
@@ -38,9 +38,9 @@ class GPTConfig:
     arch: str = "modern"
 
     def __post_init__(self) -> None:
-        if self.arch not in _VALID_ARCHS:
+        if self.arch not in VALID_ARCHS:
             raise ValueError(
-                f"Unsupported arch {self.arch!r}; expected one of {sorted(_VALID_ARCHS)}"
+                f"Unsupported arch {self.arch!r}; expected one of {sorted(VALID_ARCHS)}"
             )
         if self.n_embd % self.n_head != 0:
             raise ValueError(
