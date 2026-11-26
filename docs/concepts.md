@@ -282,7 +282,7 @@ Two quiet engineering ideas here are what make deep Transformers actually traina
 
 ### 3.6 Predicting the Next Token and Weight Tying
 
-> **Code:** [`GPT.__init__`](../src/model.py#L275-L289) and [`GPT.forward`](../src/model.py#L304-L344)
+> **Code:** [`GPT.__init__`](../src/model.py#L276-L288) and [`GPT.forward`](../src/model.py#L304-L344)
 
 After the final Transformer block and final normalization (`ln_f`), the **language modeling head (`lm_head`)** projects each token's `n_embd` vector into `vocab_size` raw scores called **logits** — one score for every token in the vocabulary.
 
@@ -463,25 +463,23 @@ uv run marimo edit main.py
 *(Changing `TrainConfig` automatically keys a new cache directory under `data/checkpoints/<run>/` so prior experiments stay preserved; only flip `overwrite_tokens = True` or `overwrite_training = True` in [`main.py`](../main.py) if you want to force rebuilding the same config!)*
 
 ### Experiment 1: Watch Language Emerge Over Time
-Train for just **10**, **200**, and **1,000+** iterations and sample after each run:
-```bash
-uv run python src/train.py --max-iters 10
-```
-- **What to watch:** At step 0, loss starts near $\ln(1024) \approx 6.93$ (or $\ln(65) \approx 4.17$ with `--tokenizer char`) and output is gibberish. Within a couple hundred steps, spaces, line breaks, and speaker prefixes (`KING:`, `FIRST CITIZEN:`) appear first. Coherent phrases and dramatic cadence emerge later!
+In the first cell of [`main.py`](../main.py), try `config = TrainConfig.auto(max_iters=10)`, then `200`, then `1000`+ — marimo will train, load, and print a fresh sample each time. *(Prefer the CLI? Run `uv run python src/train.py --max-iters 10` to train and cache a checkpoint, then point `main.py` at the same config to sample.)*
+- **What to watch:** At step 0, loss starts near $\ln(1024) \approx 6.93$ (or $\ln(128) \approx 4.85$ with `--tokenizer char`, since char's 65 symbols are padded to 128 in the model) and output is gibberish. Within a couple hundred steps, spaces, line breaks, and speaker prefixes (`KING:`, `FIRST CITIZEN:`) appear first. Coherent phrases and dramatic cadence emerge later!
 
 ### Experiment 2: Feel Temperature and Top-k (No Retraining Needed!)
 In the sampling cell of [`main.py`](../main.py), keep your already-loaded in-memory checkpoint and try:
 - `SampleConfig(start="ROMEO:\n", temperature=0.3, top_k=10)` — focused, safe, slightly repetitive.
 - `SampleConfig(start="ROMEO:\n", temperature=0.95, top_k=40)` — natural balance.
 - `SampleConfig(start="ROMEO:\n", temperature=1.8, top_k=None)` — chaotic nonsense!
+- *(Bonus: set `num_samples=3` to generate three different scenes in parallel in one batched pass!)*
 
-### Experiment 3: Trigger Overfitting on Purpose
+### Experiment 3: Trigger Overfitting (and Catch It with Early Stopping)
 In `TrainConfig.auto(...)`, set `dropout=0.0` and `weight_decay=0.0`, and train for a few thousand steps.
-- **What to watch:** `train loss` plummets far below `1.0`, while `val loss` bottoms out and starts climbing back up. Now turn `dropout=0.2` back on and compare!
+- **What to watch:** `train loss` plummets far below `1.0`, while `val loss` bottoms out and starts climbing back up. Now re-run with `dropout=0.2` (or add `early_stopping_patience=3` / `--early-stopping 3` to automatically stop on a validation plateau and restore the best weights) and compare!
 
 ### Experiment 4: Give the Model Goldfish Memory
 Compare `TrainConfig.auto(block_size=16)` vs. `TrainConfig.auto(block_size=256)`.
-- **What to watch:** With `block_size=16`, the model can only look 16 characters backward — enough to spell short words, not enough to track who is speaking or finish a coherent sentence.
+- **What to watch:** With `block_size=16`, the model can only look 16 **tokens** backward (~35–40 characters with the default BPE tokenizer, or literally 16 characters with `tokenizer="char"`) — enough for short phrases, not enough to track who is speaking or sustain a coherent speech.
 
 ### Experiment 5: Open the Artifacts on Disk
 After running once, inspect the plain JSON files created in `data/`:
@@ -489,26 +487,27 @@ After running once, inspect the plain JSON files created in `data/`:
 - `data/checkpoints/<run>/config.json` — see portable hyperparameters (no machine-local paths), cache fingerprint, and final train/val losses saved alongside `model.safetensors`.
 
 ### Experiment 6: Fine-Tune Real Pretrained GPT-2 on Shakespeare
-Instead of starting from random weights, start from OpenAI's 124M-parameter GPT-2 and fine-tune it on Shakespeare using BPE tokens:
+Instead of starting from random weights, start from OpenAI's 124M-parameter GPT-2 and fine-tune it on Shakespeare (Chat Shakespeare automatically switches to `arch="gpt2"` and the `tiktoken` GPT-2 tokenizer):
 ```bash
-uv run python src/train.py --init-from gpt2 --max-iters 200
+uv run python src/train.py --init-from gpt2 --lr 3e-4 --max-iters 200
 ```
-- **What to watch:** Compare how quickly a pretrained model adapts to Shakespearean English compared to training from scratch!
+- **What to watch:** Compare how quickly a pretrained model adapts to Shakespearean English compared to training from scratch! *(You can also compare classic GPT-2 vs. modern blocks from scratch using `--arch gpt2`, or keep fine-tuning any saved run with `--init-from data/checkpoints/<run>`.)*
 
 ---
 
 ## Code Reading Map
 
-Want to read the entire implementation top to bottom? Here is the gentlest order through `src/`:
+Want to read the entire implementation top to bottom? Here is the gentlest order through the codebase:
 
 | Order | File | Lines | What You'll Learn |
 | :---: | :--- | ---: | :--- |
 | 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 567 | Shared constants, presets, validation, atomic I/O, `arch` inference, and cache fingerprinting |
 | 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 263 | Pinned Tiny Shakespeare download, custom BPE / char / GPT-2 encoding, `safetensors` + JSON cache |
 | 3 | [`src/model.py`](../src/model.py) | 536 | Both `modern` (`RMSNorm`/RoPE/QK-Norm/`ReLU²`) and `gpt2` architectures, `KVCache`, `generate`, `from_pretrained` |
-| 4 | [`src/train.py`](../src/train.py) | 560 | Unified `TokenBatcher`, cosine LR schedule, `Accelerate` loop, early stopping, portable checkpointing |
+| 4 | [`src/train.py`](../src/train.py) | 560 | Unified `TokenBatcher`, cosine LR schedule, `Accelerate` loop, early stopping, portable checkpointing, CLI |
 | 5 | [`src/sample.py`](../src/sample.py) | 98 | Loading a saved checkpoint and batched mixed-precision sampling with vocab masking |
-| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 580 | Unit and E2E tests covering tokenizers, presets, validation, KV cache, caching, CLI, and MPS |
+| 6 | [`main.py`](../main.py) | 53 | Interactive 5-cell marimo notebook wiring config, tokenization, training, loading, and sampling |
+| 7 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 580 | Unit and E2E tests covering tokenizers, presets, validation, KV cache, caching, CLI, and MPS |
 
 ---
 
@@ -518,22 +517,27 @@ Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py
 
 | Parameter | Plain-English Meaning | Effect of Increasing / Changing It |
 | :--- | :--- | :--- |
-| `arch` | Block design (`modern` default vs `gpt2`) | `modern` uses RoPE, `RMSNorm`, QK-Norm, `ReLU²`; `gpt2` matches OpenAI GPT-2 |
+| `arch` | Block design (`modern` default vs. `gpt2`) | `modern` uses RoPE, `RMSNorm`, QK-Norm, `ReLU²`; `gpt2` matches OpenAI GPT-2 |
+| `init_from` | Where weights start (`scratch`, `gpt2`..`gpt2-xl`, or checkpoint path) | Pretrained GPT-2 auto-selects `arch="gpt2"` and `tokenizer="gpt2"` |
+| `tokenizer` / `bpe_vocab_size` | Tokenizer kind (`bpe`, `char`, `gpt2`) & BPE target vocab (`>= 257`) | Larger BPE vocab shortens sequences; `char` is great for inspecting letter-by-letter learning |
 | `n_layer` | Number of stacked Transformer blocks | Deeper reasoning capacity; slower & uses more memory |
-| `n_head` | Number of parallel attention heads per block | More specialized attention patterns (`n_embd % n_head == 0`) |
+| `n_head` | Number of parallel attention heads per block | More specialized attention patterns (`n_embd % n_head == 0`; even `head_dim` required in `modern` for RoPE) |
 | `n_embd` | Width of each token's feature vector (`C`) | Richer token representations; parameter count grows ~quadratically |
 | `block_size` | Maximum context window length (`T`) | Longer memory; attention cost grows quadratically with `T` |
-| `vocab_size` | Number of unique tokens in the dictionary | Determined by tokenizer (1,024 default BPE, 65→128 char, 50,257→50,304 GPT-2) |
+| `vocab_size` | Model embedding table size | Set from tokenizer & padded to a multiple of 64 (`1,024` default BPE, `65→128` char, `50,257→50,304` GPT-2) |
+| `bias` | Include additive bias terms in linear / norm layers | `False` by default for scratch training; `True` for pretrained GPT-2 |
 | `batch_size` | Number of chunks processed simultaneously (`B`) | Smoother gradients & faster throughput; uses more memory |
 | `gradient_accumulation_steps` | Micro-batches summed before one weight update | Simulates a larger effective batch (`batch_size × accum`) without extra VRAM |
 | `dropout` | Fraction of activations randomly zeroed in training | Reduces overfitting; too high makes learning slow/noisy |
 | `learning_rate` / `min_lr` | Peak & final step sizes for AdamW | Too high → loss explodes (`NaN`); too low → learns painfully slowly |
-| `warmup_iters` | Steps to linearly ramp LR from ~0 to peak | Stabilizes early training |
+| `warmup_iters` / `lr_decay_iters` | Warmup steps & cosine decay horizon | Warmup stabilizes early steps; `lr_decay_iters=0` keeps LR constant |
 | `max_iters` | Total training micro-steps to run | More training time; watch `val loss` so you don't overfit |
 | `early_stopping_patience` | Eval rounds without val improvement before stopping | Saves GPU time and restores best validation weights (`0` disables) |
 | `weight_decay` | Shrinkage penalty on 2D weight matrices | Regularizes model against memorization |
 | `grad_clip` | Maximum allowed gradient norm | Prevents sudden training spikes |
-| `mixed_precision` | Number format (`no`/`fp32`, `bf16`, `fp16`) | `bf16`/`fp16` speeds up GPU/MPS training & halves activation memory |
+| `mixed_precision` | Number format (`no` for `fp32`, `bf16`, `fp16`) | `bf16`/`fp16` speeds up GPU/MPS training & halves activation memory (MPS supports `bf16` or `no`) |
 | `compile` / `compile_mode` | `torch.compile` toggle & Inductor mode | CUDA defaults to `reduce-overhead` (CUDA Graphs) |
-| `temperature` | Creativity dial during generation | Lower = safer/repetitive; higher = diverse/chaotic |
-| `top_k` | Keep only the top `k` most likely next tokens | Lower = fewer weird typos; `None` = sample from full vocabulary |
+| `seed` | Random seed (`42` default, or `None`) | Makes weight init and `TokenBatcher` sampling reproducible |
+| `start` / `num_samples` / `max_new_tokens` | Prompt, parallel batch count, & output length (`SampleConfig`) | Controls what prompt seeds generation, how many scenes run in parallel, and how long they run |
+| `temperature` | Creativity dial during generation (`SampleConfig`) | Lower = safer/repetitive; higher = diverse/chaotic |
+| `top_k` | Keep only the top `k` most likely next tokens (`SampleConfig`) | Lower = fewer weird tokens; `None` = sample from full vocabulary |
