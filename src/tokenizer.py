@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import json
+import os
+import shutil
+import tempfile
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -12,8 +14,18 @@ from datasets import DatasetDict, load_dataset, load_from_disk
 from safetensors.torch import save_file
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from hyperparameters import DEFAULT_GPT2_VOCAB_SIZE, TrainConfig
+from hyperparameters import (
+    DEFAULT_BPE_VOCAB_SIZE,
+    TrainConfig,
+    is_int,
+    read_json,
+    read_json_dict,
+    read_safetensors_keys,
+    write_json_atomic,
+)
 
+_DATASET_REPO = "Trelis/tiny-shakespeare"
+_DATASET_REVISION = "2225a5674b252d623cfb151ef099d179629c2f49"
 _EOT_TOKEN = "<|endoftext|>"
 _BPE_TOKENIZER_FILE = "tokenizer.json"
 
@@ -25,7 +37,24 @@ def _gpt2_encoding() -> tiktoken.Encoding:
 
 def _split_texts(ds: DatasetDict | dict[str, Any]) -> tuple[list[str], list[str]]:
     val_split = "validation" if "validation" in ds else "test"
-    return list(ds["train"]["text"]), list(ds[val_split]["text"])
+    train_items = list(ds["train"]["text"])
+    val_items = list(ds[val_split]["text"])
+    if not any(train_items):
+        raise ValueError("Cannot tokenize empty training dataset")
+    return train_items, val_items
+
+
+def _save_safetensors_atomic(tensors: dict[str, torch.Tensor], path: Path) -> None:
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    os.close(fd)
+    try:
+        save_file(tensors, tmp_name)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def download(config: TrainConfig) -> DatasetDict:
@@ -38,67 +67,52 @@ def download(config: TrainConfig) -> DatasetDict:
             )
         return loaded
 
-    dataset = load_dataset("Trelis/tiny-shakespeare")
+    dataset = load_dataset(_DATASET_REPO, revision=_DATASET_REVISION)
     if not isinstance(dataset, DatasetDict):
         raise TypeError(
             f"Expected DatasetDict from load_dataset, got {type(dataset).__name__}"
         )
     if "Text" in dataset["train"].column_names:
         dataset = dataset.rename_column("Text", "text")
+
     config.download_path.parent.mkdir(parents=True, exist_ok=True)
-    dataset.save_to_disk(config.download_path)
+    tmp_dir = Path(tempfile.mkdtemp(dir=config.download_path.parent, prefix=".dl."))
+    try:
+        dataset.save_to_disk(tmp_dir)
+        os.replace(tmp_dir, config.download_path)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
     return dataset
 
 
-def save_meta(config: TrainConfig, meta: dict[str, Any]) -> None:
-    """Write tokenizer metadata as JSON (pickle-free)."""
-    config.meta_path.parent.mkdir(parents=True, exist_ok=True)
-    config.meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-
 def tokenize_char(
-    config: TrainConfig, ds: DatasetDict | dict[str, Any]
-) -> dict[str, list[int]]:
-    """Character-level tokenize train/val splits and persist metadata."""
+    ds: DatasetDict | dict[str, Any],
+) -> tuple[dict[str, list[int]], dict[str, Any]]:
+    """Character-level tokenize train/val splits and return (tokenized, meta)."""
     train_items, val_items = _split_texts(ds)
     train_text = "".join(train_items)
     val_text = "".join(val_items)
     chars = sorted(set(train_text + val_text))
-    if not chars:
-        raise ValueError("Cannot build character vocabulary from empty dataset")
-
     stoi = {c: i for i, c in enumerate(chars)}
-    config.tokenizer = "char"
-    config.vocab_size = len(chars)
-    print(f"\nTokenize text (char): vocab_size={config.vocab_size:,}")
-
-    save_meta(
-        config,
-        {
-            "tokenizer": "char",
-            "vocab_size": config.vocab_size,
-            "chars": "".join(chars),
-        },
+    print(f"\nTokenize text (char): vocab_size={len(chars):,}")
+    return (
+        {"train": [stoi[c] for c in train_text], "val": [stoi[c] for c in val_text]},
+        {"tokenizer": "char", "vocab_size": len(chars), "chars": "".join(chars)},
     )
-    return {
-        "train": [stoi[c] for c in train_text],
-        "val": [stoi[c] for c in val_text],
-    }
 
 
 def tokenize_bpe(
-    config: TrainConfig, ds: DatasetDict | dict[str, Any]
-) -> dict[str, list[int]]:
-    """Train a byte-level BPE tokenizer and tokenize train/val splits."""
+    ds: DatasetDict | dict[str, Any],
+    vocab_size: int = DEFAULT_BPE_VOCAB_SIZE,
+) -> tuple[dict[str, list[int]], dict[str, Any], Tokenizer]:
+    """Train a byte-level BPE tokenizer and return (tokenized, meta, tokenizer)."""
     train_items, val_items = _split_texts(ds)
-    if not any(train_items):
-        raise ValueError("Cannot train BPE tokenizer from empty training dataset")
-
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(
-        vocab_size=config.bpe_vocab_size,
+        vocab_size=vocab_size,
         special_tokens=[_EOT_TOKEN],
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=False,
@@ -117,35 +131,24 @@ def tokenize_bpe(
         return ids
 
     actual_vocab_size = tok.get_vocab_size()
-    config.tokenizer = "bpe"
-    config.vocab_size = actual_vocab_size
     print(
-        f"\nTokenize text (bpe): vocab_size={actual_vocab_size:,} "
-        f"(target={config.bpe_vocab_size:,})"
+        f"\nTokenize text (bpe): vocab_size={actual_vocab_size:,} (target={vocab_size:,})"
     )
-
-    config.token_dir.mkdir(parents=True, exist_ok=True)
-    tok_path = config.token_dir / _BPE_TOKENIZER_FILE
-    tok.save(str(tok_path))
-    save_meta(
-        config,
+    return (
+        {"train": encode_split(train_items), "val": encode_split(val_items)},
         {
             "tokenizer": "bpe",
             "vocab_size": actual_vocab_size,
-            "bpe_vocab_size": config.bpe_vocab_size,
-            "tokenizer_file": _BPE_TOKENIZER_FILE,
+            "bpe_vocab_size": vocab_size,
         },
+        tok,
     )
-    return {
-        "train": encode_split(train_items),
-        "val": encode_split(val_items),
-    }
 
 
 def tokenize_gpt2(
-    config: TrainConfig, ds: DatasetDict | dict[str, Any]
-) -> dict[str, list[int]]:
-    """Tokenize train/val splits with GPT-2 BPE (tiktoken) and persist metadata."""
+    ds: DatasetDict | dict[str, Any],
+) -> tuple[dict[str, list[int]], dict[str, Any]]:
+    """Tokenize train/val splits with GPT-2 BPE (tiktoken) and return (tokenized, meta)."""
     enc = _gpt2_encoding()
     train_items, val_items = _split_texts(ds)
 
@@ -156,60 +159,62 @@ def tokenize_gpt2(
             ids.append(enc.eot_token)
         return ids
 
-    vocab_size = (
-        config.vocab_size
-        if config.vocab_size >= enc.n_vocab
-        else DEFAULT_GPT2_VOCAB_SIZE
+    print(f"\nTokenize text (gpt2): vocab_size={enc.n_vocab:,}")
+    return (
+        {"train": encode_split(train_items), "val": encode_split(val_items)},
+        {"tokenizer": "gpt2", "vocab_size": enc.n_vocab},
     )
-    config.tokenizer = "gpt2"
-    config.vocab_size = vocab_size
-    print(f"\nTokenize text (gpt2): vocab_size={vocab_size:,}")
-
-    save_meta(
-        config,
-        {
-            "tokenizer": "gpt2",
-            "vocab_size": vocab_size,
-        },
-    )
-    return {
-        "train": encode_split(train_items),
-        "val": encode_split(val_items),
-    }
 
 
-def save_tensors(config: TrainConfig, tokenized: dict[str, list[int]]) -> None:
-    """Persist tokenized train and val splits as safetensors."""
+def save_tokens(
+    config: TrainConfig,
+    tokenized: dict[str, list[int]],
+    meta: dict[str, Any],
+    bpe_tokenizer: Tokenizer | None = None,
+) -> None:
+    """Persist tokenized splits, optional BPE tokenizer, and meta.json (written last)."""
     config.token_dir.mkdir(parents=True, exist_ok=True)
-    save_file(
-        {"train": torch.tensor(tokenized["train"], dtype=torch.long)}, config.train_path
-    )
-    save_file(
-        {"val": torch.tensor(tokenized["val"], dtype=torch.long)}, config.val_path
-    )
+    for split, path in (("train", config.train_path), ("val", config.val_path)):
+        _save_safetensors_atomic(
+            {split: torch.tensor(tokenized[split], dtype=torch.long)}, path
+        )
+    if bpe_tokenizer is not None:
+        tok_path = config.token_dir / _BPE_TOKENIZER_FILE
+        fd, tmp_name = tempfile.mkstemp(
+            dir=config.token_dir, prefix=f".{_BPE_TOKENIZER_FILE}.", suffix=".tmp"
+        )
+        os.close(fd)
+        try:
+            bpe_tokenizer.save(tmp_name)
+            os.replace(tmp_name, tok_path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+    write_json_atomic(config.meta_path, meta)
 
 
 def tokens_ready(config: TrainConfig) -> bool:
-    """Return True when tokenized splits and matching meta.json exist on disk."""
-    if not (
-        config.train_path.is_file()
-        and config.val_path.is_file()
-        and config.meta_path.is_file()
-    ):
+    """Return True when valid tokenized splits and matching meta.json exist on disk."""
+    meta = read_json(config.meta_path)
+    if meta is None or meta.get("tokenizer") != config.tokenizer:
         return False
-    try:
-        meta = json.loads(config.meta_path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    vocab_size = meta.get("vocab_size")
+    if not is_int(vocab_size) or vocab_size < 1:
         return False
-    if not isinstance(meta, dict) or meta.get("tokenizer") != config.tokenizer:
+    train_keys = read_safetensors_keys(config.train_path)
+    val_keys = read_safetensors_keys(config.val_path)
+    if train_keys is None or "train" not in train_keys:
+        return False
+    if val_keys is None or "val" not in val_keys:
         return False
     if config.tokenizer == "bpe":
-        tok_file = meta.get("tokenizer_file")
         return (
-            isinstance(tok_file, str)
-            and meta.get("bpe_vocab_size") == config.bpe_vocab_size
-            and (config.token_dir / tok_file).is_file()
+            meta.get("bpe_vocab_size") == config.bpe_vocab_size
+            and (config.token_dir / _BPE_TOKENIZER_FILE).is_file()
         )
+    if config.tokenizer == "char":
+        chars = meta.get("chars")
+        return isinstance(chars, str) and len(chars) > 0
     return True
 
 
@@ -220,28 +225,27 @@ def prepare_tokens(config: TrainConfig, overwrite: bool = False) -> Path:
         return config.token_dir
 
     ds = download(config)
+    bpe_tok: Tokenizer | None = None
     if config.tokenizer == "bpe":
-        tokenized = tokenize_bpe(config, ds)
+        tokenized, meta, bpe_tok = tokenize_bpe(ds, config.bpe_vocab_size)
     elif config.tokenizer == "gpt2":
-        tokenized = tokenize_gpt2(config, ds)
+        tokenized, meta = tokenize_gpt2(ds)
     else:
-        tokenized = tokenize_char(config, ds)
-    save_tensors(config, tokenized)
+        tokenized, meta = tokenize_char(ds)
+    save_tokens(config, tokenized, meta, bpe_tok)
     return config.token_dir
 
 
 def load_tokenizer(
     meta_path: Path | None = None,
 ) -> tuple[int, Callable[[str], list[int]], Callable[[list[int]], str]]:
-    """Return (vocab_size, encode, decode) from meta.json or default GPT-2 BPE."""
-    if meta_path is not None and meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    """Return (vocab_size, encode, decode) from meta.json or GPT-2 BPE."""
+    if meta_path is not None:
+        meta = read_json_dict(meta_path)
         tok_kind = meta.get("tokenizer")
         if tok_kind == "bpe":
-            tok_file = meta_path.parent / meta.get(
-                "tokenizer_file", _BPE_TOKENIZER_FILE
-            )
-            tok = Tokenizer.from_file(str(tok_file))
+            # Fixed filename prevents untrusted meta.json from traversing outside token_dir.
+            tok = Tokenizer.from_file(str(meta_path.parent / _BPE_TOKENIZER_FILE))
 
             def encode_bpe(text: str) -> list[int]:
                 return tok.encode(text).ids
@@ -252,9 +256,11 @@ def load_tokenizer(
             return tok.get_vocab_size(), encode_bpe, decode_bpe
 
         if tok_kind == "char":
-            chars = meta["chars"]
+            chars = meta.get("chars")
+            if not isinstance(chars, str) or not chars:
+                raise ValueError(f"Missing or invalid 'chars' in {meta_path}")
             stoi = {c: i for i, c in enumerate(chars)}
-            itos = {i: c for i, c in enumerate(chars)}
+            itos = dict(enumerate(chars))
 
             def encode_char(text: str) -> list[int]:
                 unknown = sorted({c for c in text if c not in stoi})
@@ -268,6 +274,9 @@ def load_tokenizer(
                 return "".join(itos[i] for i in ids)
 
             return len(chars), encode_char, decode_char
+
+        if tok_kind != "gpt2":
+            raise ValueError(f"Unsupported tokenizer {tok_kind!r} in {meta_path}")
 
     enc = _gpt2_encoding()
 

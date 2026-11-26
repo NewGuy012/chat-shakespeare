@@ -21,7 +21,7 @@ from sample import SampleConfig, sample
 from tokenizer import (
     load_tokenizer,
     prepare_tokens,
-    save_tensors,
+    save_tokens,
     tokenize_bpe,
     tokenize_char,
     tokenize_gpt2,
@@ -50,39 +50,40 @@ class PipelineTests(unittest.TestCase):
     def test_bpe_char_and_gpt2_tokenizers_use_json_meta(self) -> None:
         ds = {"train": {"text": ["hello world\n"]}, "test": {"text": ["hello!\n"]}}
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = TrainConfig.auto("cpu", data_path=Path(tmp))
-            bpe_tok = tokenize_bpe(cfg, ds)
-            save_tensors(cfg, bpe_tok)
-            self.assertEqual(cfg.tokenizer, "bpe")
-            self.assertTrue(cfg.meta_path.exists())
-            self.assertTrue((cfg.token_dir / "tokenizer.json").exists())
-            self.assertFalse((cfg.data_path / "meta.pkl").exists())
+            bpe_cfg = TrainConfig.auto("cpu", data_path=Path(tmp))
+            bpe_tok, bpe_meta_data, bpe_obj = tokenize_bpe(ds, bpe_cfg.bpe_vocab_size)
+            save_tokens(bpe_cfg, bpe_tok, bpe_meta_data, bpe_obj)
+            self.assertTrue(bpe_cfg.meta_path.exists())
+            self.assertTrue((bpe_cfg.token_dir / "tokenizer.json").exists())
+            self.assertFalse((bpe_cfg.data_path / "meta.pkl").exists())
 
-            bpe_vocab, enc_bpe, dec_bpe = load_tokenizer(cfg.meta_path)
-            self.assertEqual(bpe_vocab, cfg.vocab_size)
+            bpe_vocab, enc_bpe, dec_bpe = load_tokenizer(bpe_cfg.meta_path)
+            self.assertEqual(bpe_vocab, bpe_meta_data["vocab_size"])
             self.assertEqual(
                 dec_bpe(enc_bpe("hello? — <|endoftext|>")),
                 "hello? — <|endoftext|>",
             )
 
-            bpe_meta = cfg.meta_path
-            save_tensors(cfg, tokenize_char(cfg, ds))
-            self.assertTrue(cfg.meta_path.exists())
-            self.assertTrue(bpe_meta.exists())
-            self.assertNotEqual(cfg.meta_path, bpe_meta)
+            char_cfg = TrainConfig.auto("cpu", data_path=Path(tmp), tokenizer="char")
+            char_tok, char_meta_data = tokenize_char(ds)
+            save_tokens(char_cfg, char_tok, char_meta_data)
+            self.assertTrue(char_cfg.meta_path.exists())
+            self.assertTrue(bpe_cfg.meta_path.exists())
+            self.assertNotEqual(char_cfg.meta_path, bpe_cfg.meta_path)
 
-            vocab_size, encode, decode = load_tokenizer(cfg.meta_path)
-            self.assertEqual(vocab_size, cfg.vocab_size)
+            vocab_size, encode, decode = load_tokenizer(char_cfg.meta_path)
+            self.assertEqual(vocab_size, char_meta_data["vocab_size"])
             self.assertEqual(decode(encode("hello!")), "hello!")
             with self.assertRaises(ValueError):
                 encode("?")
 
-            char_meta = cfg.meta_path
-            gpt2_tok = tokenize_gpt2(cfg, ds)
+            gpt2_cfg = TrainConfig.auto("cpu", data_path=Path(tmp), tokenizer="gpt2")
+            gpt2_tok, gpt2_meta_data = tokenize_gpt2(ds)
+            save_tokens(gpt2_cfg, gpt2_tok, gpt2_meta_data)
             self.assertGreater(len(gpt2_tok["train"]), 0)
-            self.assertTrue(char_meta.exists())
-            self.assertNotEqual(cfg.meta_path, char_meta)
-            _, enc_gpt2, dec_gpt2 = load_tokenizer(cfg.meta_path)
+            self.assertTrue(char_cfg.meta_path.exists())
+            self.assertNotEqual(gpt2_cfg.meta_path, char_cfg.meta_path)
+            _, enc_gpt2, dec_gpt2 = load_tokenizer(gpt2_cfg.meta_path)
             self.assertEqual(dec_gpt2(enc_gpt2("hello world")), "hello world")
 
     def test_prepare_tokens_caches_by_tokenizer(self) -> None:
@@ -418,7 +419,8 @@ class PipelineTests(unittest.TestCase):
                 log_iters=2,
                 eval_iters=2,
             )
-            save_tensors(cfg, tokenize_bpe(cfg, ds))
+            with patch("tokenizer.download", return_value=ds):
+                prepare_tokens(cfg)
             acc = Accelerator(
                 cpu=True, mixed_precision="no", gradient_accumulation_steps=2
             )
@@ -438,7 +440,8 @@ class PipelineTests(unittest.TestCase):
 
             # Sampling from disk resolves the checkpoint's own tokenizer even if caller config differs.
             char_view = TrainConfig.auto("cpu", data_path=Path(tmp), tokenizer="char")
-            save_tensors(char_view, tokenize_char(char_view, ds))
+            with patch("tokenizer.download", return_value=ds):
+                prepare_tokens(char_view)
             resumed = TrainConfig.auto(
                 "cpu", data_path=Path(tmp), init_from=str(ckpt_dir)
             )
@@ -679,7 +682,8 @@ class PipelineTests(unittest.TestCase):
                 log_iters=1,
                 eval_iters=1,
             )
-            save_tensors(cfg, tokenize_char(cfg, ds))
+            with patch("tokenizer.download", return_value=ds):
+                prepare_tokens(cfg)
             raw_vocab, _, _ = load_tokenizer(cfg.meta_path)
             self.assertEqual(raw_vocab, 30)
 
@@ -785,7 +789,8 @@ class PipelineTests(unittest.TestCase):
                 eval_iters=1,
                 early_stopping_patience=1,
             )
-            save_tensors(cfg, tokenize_bpe(cfg, ds))
+            with patch("tokenizer.download", return_value=ds):
+                prepare_tokens(cfg)
             eval_seq = iter(
                 [
                     {"train": 5.0, "val": 5.0},
@@ -876,7 +881,8 @@ class PipelineTests(unittest.TestCase):
                 log_iters=2,
                 eval_iters=1,
             )
-            save_tensors(cfg, tokenize_bpe(cfg, ds))
+            with patch("tokenizer.download", return_value=ds):
+                prepare_tokens(cfg)
             acc, trained_model, losses = train(cfg)
             self.assertIn("val", losses)
             ckpt_dir = save_checkpoint(cfg, acc, trained_model, losses)
