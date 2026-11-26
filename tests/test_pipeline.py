@@ -62,6 +62,53 @@ class PipelineTests(unittest.TestCase):
             cpu.min_lr,
         )
 
+    def test_cache_paths_and_fingerprint(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            base = TrainConfig.auto("cpu", data_path=Path(tmp1))
+            same_diff_log = TrainConfig.auto(
+                "cpu", data_path=Path(tmp2), log_iters=10, eval_iters=3, compile=True
+            )
+            self.assertEqual(base.tokenizer, "char")
+            self.assertEqual(base.token_dir, Path(tmp1) / "tokens" / "char")
+            self.assertEqual(base.fingerprint(), same_diff_log.fingerprint())
+            self.assertEqual(base.checkpoint_name, same_diff_log.checkpoint_name)
+
+            # Dataset-derived vocab_size mutation for char must not change checkpoint_dir.
+            before_dir = base.checkpoint_dir
+            base.vocab_size = 65
+            self.assertEqual(base.checkpoint_dir, before_dir)
+
+            # Hyperparameter change produces a distinct checkpoint directory.
+            tuned = TrainConfig.auto("cpu", data_path=Path(tmp1), dropout=0.25)
+            self.assertNotEqual(tuned.checkpoint_dir, before_dir)
+
+            # Pretrained GPT-2 auto-selects gpt2 tokenizer and ignores preset scratch dims.
+            gpt2_a = TrainConfig.auto(
+                "cpu", data_path=Path(tmp1), init_from="gpt2", block_size=256
+            )
+            gpt2_b = TrainConfig.auto(
+                "cpu",
+                data_path=Path(tmp1),
+                init_from="gpt2",
+                block_size=256,
+                n_layer=12,
+                n_head=12,
+                n_embd=768,
+                bias=True,
+                vocab_size=50257,
+            )
+            self.assertEqual(gpt2_a.tokenizer, "gpt2")
+            self.assertEqual(gpt2_a.token_dir, Path(tmp1) / "tokens" / "gpt2")
+            self.assertEqual(gpt2_a.checkpoint_dir, gpt2_b.checkpoint_dir)
+            self.assertNotEqual(gpt2_a.token_dir, base.token_dir)
+
+            # Invalid tokenizer raises ValueError.
+            with self.assertRaises(ValueError):
+                TrainConfig.auto("cpu", tokenizer="unknown")
+
     def test_model_guards_and_from_pretrained_safetensors(self) -> None:
         model = GPT(
             GPTConfig(block_size=8, vocab_size=16, n_layer=1, n_head=2, n_embd=8)
