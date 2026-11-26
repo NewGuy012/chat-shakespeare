@@ -4,17 +4,18 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState, PartialState
-from safetensors.torch import save_file
+from safetensors.torch import save_file, save_model
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hyperparameters import TrainConfig
-from model import GPT, Block, GPTConfig
+from model import GPT, Block, GPTConfig, KVCache, ReLU2, RMSNorm
 from sample import SampleConfig, sample
 from tokenizer import (
     load_tokenizer,
@@ -126,10 +127,35 @@ class PipelineTests(unittest.TestCase):
 
     def test_presets_and_lr_schedule(self) -> None:
         cpu = TrainConfig.auto("cpu", max_iters=200)
+        self.assertEqual(cpu.arch, "modern")
         self.assertEqual(cpu.mixed_precision, "no")
+        self.assertEqual(cpu.compile_mode, "default")
         self.assertEqual(cpu.lr_decay_iters, 200)
-        self.assertEqual(TrainConfig.auto("cuda").compile, True)
+        cuda_default = TrainConfig.auto("cuda")
+        self.assertEqual(cuda_default.compile, True)
+        self.assertEqual(cuda_default.compile_mode, "reduce-overhead")
         self.assertEqual(TrainConfig.auto("mps").device, "mps")
+
+        # VRAM-tiered CUDA presets (8 GB, 16 GB, 48 GB Thunder Compute A6000/L40).
+        for vram_gb, expected_bs, expected_accum, expected_iters, expected_beta2 in [
+            (8, 32, 2, 5000, 0.99),
+            (16, 64, 1, 5000, 0.99),
+            (48, 128, 1, 2500, 0.95),
+        ]:
+            props = SimpleNamespace(total_memory=vram_gb * 1024**3)
+            with (
+                patch("torch.cuda.is_available", return_value=True),
+                patch("torch.cuda.current_device", return_value=0),
+                patch("torch.cuda.get_device_properties", return_value=props),
+                patch("torch.cuda.is_bf16_supported", return_value=True),
+            ):
+                cuda_cfg = TrainConfig.auto("cuda")
+                self.assertEqual(cuda_cfg.batch_size, expected_bs)
+                self.assertEqual(cuda_cfg.gradient_accumulation_steps, expected_accum)
+                self.assertEqual(cuda_cfg.max_iters, expected_iters)
+                self.assertEqual(cuda_cfg.lr_decay_iters, expected_iters)
+                self.assertEqual(cuda_cfg.beta2, expected_beta2)
+                self.assertEqual(cuda_cfg.mixed_precision, "bf16")
 
         self.assertLess(get_lr(cpu, 0), cpu.learning_rate)
         self.assertEqual(get_lr(cpu, cpu.lr_decay_iters), cpu.min_lr)
@@ -149,8 +175,14 @@ class PipelineTests(unittest.TestCase):
         ):
             base = TrainConfig.auto("cpu", data_path=Path(tmp1))
             same_diff_log = TrainConfig.auto(
-                "cpu", data_path=Path(tmp2), log_iters=10, eval_iters=3, compile=True
+                "cpu",
+                data_path=Path(tmp2),
+                log_iters=10,
+                eval_iters=3,
+                compile=True,
+                compile_mode="max-autotune",
             )
+            self.assertEqual(base.arch, "modern")
             self.assertEqual(base.tokenizer, "bpe")
             self.assertEqual(base.bpe_vocab_size, 1024)
             self.assertEqual(base.vocab_size, 1024)
@@ -162,6 +194,12 @@ class PipelineTests(unittest.TestCase):
             before_dir = base.checkpoint_dir
             base.vocab_size = 300
             self.assertEqual(base.checkpoint_dir, before_dir)
+
+            # Switching arch produces a distinct checkpoint directory and fingerprint.
+            gpt2_arch = TrainConfig.auto("cpu", data_path=Path(tmp1), arch="gpt2")
+            self.assertNotEqual(gpt2_arch.checkpoint_dir, before_dir)
+            self.assertIn("scratch-gpt2-", gpt2_arch.checkpoint_name)
+            self.assertIn("scratch-modern-", base.checkpoint_name)
 
             # Changing BPE target vocab size produces distinct token and checkpoint paths.
             bpe_512 = TrainConfig.auto("cpu", data_path=Path(tmp1), vocab_size=512)
@@ -182,7 +220,7 @@ class PipelineTests(unittest.TestCase):
             tuned = TrainConfig.auto("cpu", data_path=Path(tmp1), dropout=0.25)
             self.assertNotEqual(tuned.checkpoint_dir, before_dir)
 
-            # Pretrained GPT-2 auto-selects gpt2 tokenizer and ignores preset scratch dims.
+            # Pretrained GPT-2 auto-selects gpt2 arch & tokenizer and ignores preset scratch dims.
             gpt2_a = TrainConfig.auto(
                 "cpu", data_path=Path(tmp1), init_from="gpt2", block_size=256
             )
@@ -190,6 +228,7 @@ class PipelineTests(unittest.TestCase):
                 "cpu",
                 data_path=Path(tmp1),
                 init_from="gpt2",
+                arch="modern",
                 block_size=256,
                 n_layer=12,
                 n_head=12,
@@ -197,6 +236,9 @@ class PipelineTests(unittest.TestCase):
                 bias=True,
                 vocab_size=50257,
             )
+            self.assertEqual(gpt2_a.arch, "gpt2")
+            self.assertEqual(gpt2_b.arch, "gpt2")
+            self.assertEqual(TrainConfig(init_from="gpt2").arch, "gpt2")
             self.assertEqual(gpt2_a.tokenizer, "gpt2")
             self.assertEqual(gpt2_a.vocab_size, 50304)
             self.assertEqual(gpt2_a.token_dir, Path(tmp1) / "tokens" / "gpt2")
@@ -209,29 +251,99 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(gpt2_scratch.vocab_size, 50304)
 
-            # Legacy char checkpoint config without tokenizer field still infers char.
+            # Legacy char checkpoint config without arch/tokenizer still infers gpt2/char.
             legacy_char = TrainConfig.from_dict(
                 {"init_from": "scratch", "vocab_size": 65}
             )
             self.assertEqual(legacy_char.tokenizer, "char")
+            self.assertEqual(legacy_char.arch, "gpt2")
 
-            # Invalid tokenizer or too-small bpe_vocab_size raises ValueError.
+            # Local GPT-2 safetensors checkpoint auto-switches arch to gpt2 even without arch in config.json.
+            local_gpt2_dir = Path(tmp1) / "local_gpt2"
+            local_gpt2_dir.mkdir()
+            legacy_gpt2_model = GPT(
+                GPTConfig(
+                    block_size=8,
+                    vocab_size=64,
+                    n_layer=1,
+                    n_head=2,
+                    n_embd=8,
+                    arch="gpt2",
+                )
+            )
+            save_model(legacy_gpt2_model, str(local_gpt2_dir / "model.safetensors"))
+            inferred_gpt2 = TrainConfig.auto(
+                "cpu", data_path=Path(tmp1), init_from=str(local_gpt2_dir)
+            )
+            self.assertEqual(inferred_gpt2.arch, "gpt2")
+
+            # Invalid arch, compile_mode, tokenizer, or too-small bpe_vocab_size raises ValueError.
+            with self.assertRaises(ValueError):
+                TrainConfig.auto("cpu", arch="unknown")
+            with self.assertRaises(ValueError):
+                TrainConfig.auto("cpu", compile_mode="turbo")
             with self.assertRaises(ValueError):
                 TrainConfig.auto("cpu", tokenizer="unknown")
             with self.assertRaises(ValueError):
                 TrainConfig.auto("cpu", vocab_size=100)
+            with self.assertRaises(ValueError):
+                TrainConfig.auto("cpu", n_embd=12, n_head=4, arch="modern")
 
     def test_model_guards_and_from_pretrained_safetensors(self) -> None:
-        model = GPT(
-            GPTConfig(block_size=8, vocab_size=16, n_layer=1, n_head=2, n_embd=8)
-        )
-        idx = torch.randint(0, 16, (1, 4))
-        out = model.generate(idx, max_new_tokens=3, temperature=1.0, top_k=4)
-        self.assertEqual(out.shape, (1, 7))
-        with self.assertRaises(ValueError):
-            model.generate(idx, max_new_tokens=1, temperature=0.0)
-        with self.assertRaises(ValueError):
-            model(torch.randint(0, 16, (1, 9)))
+        for arch in ("modern", "gpt2"):
+            model = GPT(
+                GPTConfig(
+                    block_size=8,
+                    vocab_size=16,
+                    n_layer=1,
+                    n_head=2,
+                    n_embd=8,
+                    arch=arch,
+                )
+            )
+            model.eval()
+            block0 = model.transformer.h[0]
+            assert isinstance(block0, Block)
+            if arch == "modern":
+                self.assertIsNone(model.transformer.wpe)
+                self.assertIsInstance(block0.ln_1, RMSNorm)
+                self.assertIsInstance(block0.mlp.act, ReLU2)
+                self.assertIsNotNone(block0.attn.q_norm)
+            else:
+                self.assertIsNotNone(model.transformer.wpe)
+                self.assertIsInstance(block0.ln_1, torch.nn.LayerNorm)
+
+            idx = torch.randint(0, 16, (1, 4))
+            targets = torch.randint(0, 16, (1, 4))
+            logits_none, loss = model(idx, targets, return_logits=False)
+            self.assertIsNone(logits_none)
+            assert loss is not None
+            self.assertEqual(loss.ndim, 0)
+
+            # KV cache prefill + single-token decode matches full uncached forward logits.
+            full_idx = torch.randint(0, 16, (2, 6))
+            uncached_logits, _ = model(full_idx)
+            cache = KVCache(model.config.n_layer, model.config.block_size)
+            _, _ = model(full_idx[:, :4], pos_offset=0, kv_cache=cache)
+            _, _ = model(full_idx[:, 4:5], pos_offset=4, kv_cache=cache)
+            cached_logits, _ = model(full_idx[:, 5:6], pos_offset=5, kv_cache=cache)
+            assert uncached_logits is not None and cached_logits is not None
+            self.assertTrue(torch.allclose(uncached_logits, cached_logits, atol=1e-4))
+
+            # Generate works across block_size boundary (sliding window) and masks padded vocab IDs.
+            out = model.generate(
+                idx, max_new_tokens=9, temperature=1.0, top_k=4, valid_vocab_size=10
+            )
+            self.assertEqual(out.shape, (1, 13))
+            self.assertTrue(bool((out[:, 4:] < 10).all()))
+
+            model.crop_block_size(4)
+            self.assertEqual(model.config.block_size, 4)
+
+            with self.assertRaises(ValueError):
+                model.generate(idx, max_new_tokens=1, temperature=0.0)
+            with self.assertRaises(ValueError):
+                model(torch.randint(0, 16, (1, 5)))
 
         tiny_spec = {"gpt2": {"n_layer": 1, "n_head": 2, "n_embd": 8}}
         with (
@@ -260,6 +372,12 @@ class PipelineTests(unittest.TestCase):
             weights_path = Path(tmp) / "model.safetensors"
             save_file(raw_sd, str(weights_path))
             loaded = GPT.from_pretrained("gpt2", weights_path=weights_path)
+            self.assertEqual(loaded.config.arch, "gpt2")
+            self.assertEqual(loaded.config.vocab_size, 50304)
+            self.assertTrue(
+                torch.equal(loaded.transformer.wte.weight[:50257], raw_sd["wte.weight"])
+            )
+            self.assertTrue(bool((loaded.transformer.wte.weight[50257:] == 0).all()))
             block0 = loaded.transformer.h[0]
             assert isinstance(block0, Block)
             self.assertTrue(

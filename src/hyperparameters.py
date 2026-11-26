@@ -9,10 +9,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors import SafetensorError, safe_open
 
 _DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 _VALID_DEVICES = frozenset({"cpu", "mps", "cuda"})
 _VALID_PRECISIONS = frozenset({"no", "fp16", "bf16"})
+_VALID_ARCHS = frozenset({"modern", "gpt2"})
+_DEFAULT_ARCH = "modern"
+_VALID_COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
 _VALID_TOKENIZERS = frozenset({"bpe", "char", "gpt2"})
 _DEFAULT_TOKENIZER = "bpe"
 _BPE_MIN_VOCAB_SIZE = 257
@@ -21,6 +25,13 @@ _GPT2_MIN_VOCAB_SIZE = 50257
 _DEFAULT_GPT2_VOCAB_SIZE = 50304
 _PRETRAINED_MODELS = frozenset({"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"})
 _PRETRAINED_BLOCK_SIZE = 1024
+
+
+def pad_vocab_size(vocab_size: int, multiple: int = 64) -> int:
+    """Round vocab_size up to a clean multiple for Tensor Core / SIMD alignment."""
+    if multiple <= 1:
+        return vocab_size
+    return ((vocab_size + multiple - 1) // multiple) * multiple
 
 
 def _read_checkpoint_config(init_from: str) -> dict[str, Any] | None:
@@ -34,6 +45,37 @@ def _read_checkpoint_config(init_from: str) -> dict[str, Any] | None:
     except OSError, json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _read_safetensors_keys(weights_file: Path) -> set[str] | None:
+    if not weights_file.is_file():
+        return None
+    try:
+        with safe_open(str(weights_file), framework="pt", device="cpu") as f:
+            return set(f.keys())
+    except OSError, SafetensorError:
+        return None
+
+
+def _infer_arch(init_from: str) -> str:
+    if init_from in _PRETRAINED_MODELS:
+        return "gpt2"
+    if init_from == "scratch":
+        return _DEFAULT_ARCH
+    keys = _read_safetensors_keys(Path(init_from) / "model.safetensors")
+    if keys is not None:
+        return (
+            "gpt2"
+            if ("transformer.wpe.weight" in keys or "wpe.weight" in keys)
+            else "modern"
+        )
+    ckpt_cfg = _read_checkpoint_config(init_from)
+    if ckpt_cfg is not None:
+        arch = ckpt_cfg.get("arch")
+        if isinstance(arch, str) and arch in _VALID_ARCHS:
+            return arch
+        return "gpt2"
+    return _DEFAULT_ARCH
 
 
 def _infer_tokenizer(init_from: str) -> str:
@@ -94,6 +136,7 @@ def _device_preset(target: str) -> dict[str, Any]:
             "device": "cpu",
             "mixed_precision": "no",
             "compile": False,
+            "compile_mode": "default",
             "n_layer": 4,
             "n_head": 4,
             "n_embd": 128,
@@ -117,6 +160,7 @@ def _device_preset(target: str) -> dict[str, Any]:
             "device": "mps",
             "mixed_precision": "bf16" if mps_bf16 else "no",
             "compile": False,
+            "compile_mode": "default",
             "n_layer": 6,
             "n_head": 6,
             "n_embd": 384,
@@ -133,27 +177,39 @@ def _device_preset(target: str) -> dict[str, Any]:
             "log_iters": 250,
         }
     if target == "cuda":
-        low_vram = (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_properties(0).total_memory < 12 * 1024**3
-        )
-        bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        vram_gb = 0.0
+        bf16 = False
+        if torch.cuda.is_available():
+            dev_idx = torch.cuda.current_device()
+            vram_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024**3)
+            bf16 = torch.cuda.is_bf16_supported()
+        if 0.0 < vram_gb < 12.0:
+            batch_size, grad_accum = 32, 2
+            lr, min_lr, beta2, max_iters = 1e-3, 1e-4, 0.99, 5000
+        elif vram_gb >= 40.0:
+            batch_size, grad_accum = 128, 1
+            lr, min_lr, beta2, max_iters = 1.4e-3, 1.4e-4, 0.95, 2500
+        else:
+            batch_size, grad_accum = 64, 1
+            lr, min_lr, beta2, max_iters = 1e-3, 1e-4, 0.99, 5000
         return {
             "device": "cuda",
             "mixed_precision": "bf16" if bf16 else "fp16",
             "compile": True,
+            "compile_mode": "reduce-overhead",
             "n_layer": 6,
             "n_head": 6,
             "n_embd": 384,
             "block_size": 256,
-            "batch_size": 32 if low_vram else 64,
-            "gradient_accumulation_steps": 2 if low_vram else 1,
+            "batch_size": batch_size,
+            "gradient_accumulation_steps": grad_accum,
             "dropout": 0.2,
-            "learning_rate": 1e-3,
-            "min_lr": 1e-4,
-            "max_iters": 5000,
+            "learning_rate": lr,
+            "min_lr": min_lr,
+            "beta2": beta2,
+            "max_iters": max_iters,
             "warmup_iters": 100,
-            "lr_decay_iters": 5000,
+            "lr_decay_iters": max_iters,
             "eval_iters": 20,
             "log_iters": 250,
         }
@@ -176,6 +232,7 @@ class TrainConfig:
     n_embd: int = 128
     dropout: float = 0.1
     bias: bool = False
+    arch: str = _DEFAULT_ARCH
     init_from: str = "scratch"
     tokenizer: str = _DEFAULT_TOKENIZER
     bpe_vocab_size: int = _DEFAULT_BPE_VOCAB_SIZE
@@ -193,6 +250,8 @@ class TrainConfig:
     mixed_precision: str = "no"
     gradient_accumulation_steps: int = 2
     compile: bool = False
+    compile_mode: str = "default"
+    early_stopping_patience: int = 0
     eval_iters: int = 10
     log_iters: int = 100
     seed: int | None = 42
@@ -208,13 +267,31 @@ class TrainConfig:
             raise ValueError(
                 f"Unsupported mixed_precision {self.mixed_precision!r}; expected one of {sorted(_VALID_PRECISIONS)}"
             )
+        if self.arch not in _VALID_ARCHS:
+            raise ValueError(
+                f"Unsupported arch {self.arch!r}; expected one of {sorted(_VALID_ARCHS)}"
+            )
+        if self.compile_mode not in _VALID_COMPILE_MODES:
+            raise ValueError(
+                f"Unsupported compile_mode {self.compile_mode!r}; expected one of {sorted(_VALID_COMPILE_MODES)}"
+            )
         if self.tokenizer not in _VALID_TOKENIZERS:
             raise ValueError(
                 f"Unsupported tokenizer {self.tokenizer!r}; expected one of {sorted(_VALID_TOKENIZERS)}"
             )
+        if self.init_from in _PRETRAINED_MODELS:
+            self.arch = "gpt2"
         if self.n_embd % self.n_head != 0:
             raise ValueError(
                 f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
+            )
+        if (
+            self.arch == "modern"
+            and self.init_from == "scratch"
+            and (self.n_embd // self.n_head) % 2 != 0
+        ):
+            raise ValueError(
+                f"arch='modern' requires even head_dim for RoPE, got {self.n_embd // self.n_head}"
             )
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
@@ -244,9 +321,11 @@ class TrainConfig:
             or self.warmup_iters < 0
             or self.lr_decay_iters < 0
             or self.grad_clip < 0
+            or self.early_stopping_patience < 0
         ):
             raise ValueError(
-                "epoch_iters, warmup_iters, lr_decay_iters, and grad_clip must be >= 0"
+                "epoch_iters, warmup_iters, lr_decay_iters, grad_clip, "
+                "and early_stopping_patience must be >= 0"
             )
 
     @property
@@ -302,9 +381,12 @@ class TrainConfig:
             "mixed_precision": self.mixed_precision,
             "seed": None if self.seed is None else int(self.seed),
         }
+        if self.early_stopping_patience > 0:
+            payload["early_stopping_patience"] = int(self.early_stopping_patience)
         if self.init_from == "scratch":
             payload.update(
                 {
+                    "arch": self.arch,
                     "n_layer": int(self.n_layer),
                     "n_head": int(self.n_head),
                     "n_embd": int(self.n_embd),
@@ -314,7 +396,7 @@ class TrainConfig:
             if self.tokenizer == "bpe":
                 payload["bpe_vocab_size"] = int(self.bpe_vocab_size)
             elif self.tokenizer == "gpt2":
-                payload["vocab_size"] = (
+                payload["vocab_size"] = pad_vocab_size(
                     int(self.vocab_size)
                     if int(self.vocab_size) >= _GPT2_MIN_VOCAB_SIZE
                     else _DEFAULT_GPT2_VOCAB_SIZE
@@ -331,7 +413,7 @@ class TrainConfig:
             f"bpe{self.bpe_vocab_size}" if self.tokenizer == "bpe" else self.tokenizer
         )
         if self.init_from == "scratch":
-            prefix = f"scratch-{tok_label}-{self.n_layer}l{self.n_embd}d-b{block_size}"
+            prefix = f"scratch-{self.arch}-{tok_label}-{self.n_layer}l{self.n_embd}d-b{block_size}"
         elif self.init_from in _PRETRAINED_MODELS:
             prefix = f"{self.init_from}-{tok_label}-b{block_size}"
         else:
@@ -357,6 +439,7 @@ class TrainConfig:
             "n_embd": self.n_embd,
             "dropout": self.dropout,
             "bias": self.bias,
+            "arch": self.arch,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -368,6 +451,8 @@ class TrainConfig:
     def from_dict(cls, data: dict[str, Any]) -> TrainConfig:
         valid_fields = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in data.items() if k in valid_fields}
+        if "arch" not in filtered:
+            filtered["arch"] = "gpt2"
         if "tokenizer" not in filtered:
             init_from = filtered.get("init_from")
             vocab_size = filtered.get("vocab_size")
@@ -398,6 +483,9 @@ class TrainConfig:
 
         if "max_iters" in overrides and "lr_decay_iters" not in overrides:
             preset["lr_decay_iters"] = overrides["max_iters"]
+
+        if "arch" not in overrides and "init_from" in overrides:
+            preset["arch"] = _infer_arch(str(overrides["init_from"]))
 
         target_tokenizer = (
             str(overrides["tokenizer"])
