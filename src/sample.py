@@ -32,7 +32,7 @@ def sample(
     if model is None:
         ckpt_cfg, model = load_checkpoint(config.checkpoint_dir, device=device)
         meta_path = (
-            config.meta_path if config.meta_path.exists() else ckpt_cfg.meta_path
+            ckpt_cfg.meta_path if ckpt_cfg.meta_path.exists() else config.meta_path
         )
     else:
         model.to(device)
@@ -40,7 +40,7 @@ def sample(
 
     tok_vocab_size, encode, decode = load_tokenizer(meta_path)
     if tok_vocab_size < 50257 and model.config.vocab_size >= 50257:
-        # Pretrained GPT-2 models expect GPT-2 BPE even if local data/meta.json is char-level.
+        # Pretrained GPT-2 models expect GPT-2 BPE even if local meta.json is bpe or char.
         _, encode, decode = load_tokenizer(None)
 
     start_ids = encode(sample_config.start)

@@ -20,6 +20,7 @@ from tokenizer import (
     load_tokenizer,
     prepare_tokens,
     save_tensors,
+    tokenize_bpe,
     tokenize_char,
     tokenize_gpt2,
     tokens_ready,
@@ -42,13 +43,29 @@ class PipelineTests(unittest.TestCase):
         AcceleratorState._reset_state()
         PartialState._reset_state()
 
-    def test_char_and_gpt2_tokenizers_use_json_meta(self) -> None:
+    def test_bpe_char_and_gpt2_tokenizers_use_json_meta(self) -> None:
         ds = {"train": {"text": ["hello world\n"]}, "test": {"text": ["hello!\n"]}}
         with tempfile.TemporaryDirectory() as tmp:
             cfg = TrainConfig.auto("cpu", data_path=Path(tmp))
+            bpe_tok = tokenize_bpe(cfg, ds)
+            save_tensors(cfg, bpe_tok)
+            self.assertEqual(cfg.tokenizer, "bpe")
+            self.assertTrue(cfg.meta_path.exists())
+            self.assertTrue((cfg.token_dir / "tokenizer.json").exists())
+            self.assertFalse((cfg.data_path / "meta.pkl").exists())
+
+            bpe_vocab, enc_bpe, dec_bpe = load_tokenizer(cfg.meta_path)
+            self.assertEqual(bpe_vocab, cfg.vocab_size)
+            self.assertEqual(
+                dec_bpe(enc_bpe("hello? — <|endoftext|>")),
+                "hello? — <|endoftext|>",
+            )
+
+            bpe_meta = cfg.meta_path
             save_tensors(cfg, tokenize_char(cfg, ds))
             self.assertTrue(cfg.meta_path.exists())
-            self.assertFalse((cfg.data_path / "meta.pkl").exists())
+            self.assertTrue(bpe_meta.exists())
+            self.assertNotEqual(cfg.meta_path, bpe_meta)
 
             vocab_size, encode, decode = load_tokenizer(cfg.meta_path)
             self.assertEqual(vocab_size, cfg.vocab_size)
@@ -67,32 +84,44 @@ class PipelineTests(unittest.TestCase):
     def test_prepare_tokens_caches_by_tokenizer(self) -> None:
         ds = {"train": {"text": ["hello world\n"]}, "test": {"text": ["hello!\n"]}}
         with tempfile.TemporaryDirectory() as tmp:
-            char_cfg = TrainConfig.auto("cpu", data_path=Path(tmp))
+            bpe_cfg = TrainConfig.auto("cpu", data_path=Path(tmp))
+            bpe_512_cfg = TrainConfig.auto("cpu", data_path=Path(tmp), vocab_size=512)
+            char_cfg = TrainConfig.auto("cpu", data_path=Path(tmp), tokenizer="char")
             gpt2_cfg = TrainConfig.auto(
                 "cpu", data_path=Path(tmp), init_from="gpt2", block_size=8
             )
             with patch("tokenizer.download", return_value=ds) as mock_dl:
-                prepare_tokens(char_cfg)
+                prepare_tokens(bpe_cfg)
                 self.assertEqual(mock_dl.call_count, 1)
-                self.assertTrue(tokens_ready(char_cfg))
+                self.assertTrue(tokens_ready(bpe_cfg))
 
                 # Second call for same tokenizer hits cache without calling download.
-                prepare_tokens(char_cfg)
+                prepare_tokens(bpe_cfg)
                 self.assertEqual(mock_dl.call_count, 1)
 
-                # Different tokenizer does not collide and caches separately.
+                # Different BPE vocab size, char, and gpt2 each cache separately.
+                prepare_tokens(bpe_512_cfg)
+                prepare_tokens(char_cfg)
                 prepare_tokens(gpt2_cfg)
-                self.assertEqual(mock_dl.call_count, 2)
-                self.assertTrue(tokens_ready(gpt2_cfg))
+                self.assertEqual(mock_dl.call_count, 4)
+                self.assertTrue(tokens_ready(bpe_512_cfg))
                 self.assertTrue(tokens_ready(char_cfg))
+                self.assertTrue(tokens_ready(gpt2_cfg))
+                self.assertTrue(tokens_ready(bpe_cfg))
 
-                # overwrite=True forces retokenization; corrupted meta invalidates cache.
+                # Missing tokenizer.json invalidates BPE cache; overwrite=True rebuilds.
+                (bpe_cfg.token_dir / "tokenizer.json").unlink()
+                self.assertFalse(tokens_ready(bpe_cfg))
+                prepare_tokens(bpe_cfg)
+                self.assertEqual(mock_dl.call_count, 5)
+                self.assertTrue(tokens_ready(bpe_cfg))
+
                 prepare_tokens(char_cfg, overwrite=True)
-                self.assertEqual(mock_dl.call_count, 3)
+                self.assertEqual(mock_dl.call_count, 6)
                 char_cfg.meta_path.write_text('{"tokenizer": "gpt2"}', encoding="utf-8")
                 self.assertFalse(tokens_ready(char_cfg))
                 prepare_tokens(char_cfg)
-                self.assertEqual(mock_dl.call_count, 4)
+                self.assertEqual(mock_dl.call_count, 7)
                 self.assertTrue(tokens_ready(char_cfg))
 
     def test_presets_and_lr_schedule(self) -> None:
@@ -122,15 +151,32 @@ class PipelineTests(unittest.TestCase):
             same_diff_log = TrainConfig.auto(
                 "cpu", data_path=Path(tmp2), log_iters=10, eval_iters=3, compile=True
             )
-            self.assertEqual(base.tokenizer, "char")
-            self.assertEqual(base.token_dir, Path(tmp1) / "tokens" / "char")
+            self.assertEqual(base.tokenizer, "bpe")
+            self.assertEqual(base.bpe_vocab_size, 1024)
+            self.assertEqual(base.vocab_size, 1024)
+            self.assertEqual(base.token_dir, Path(tmp1) / "tokens" / "bpe-1024")
             self.assertEqual(base.fingerprint(), same_diff_log.fingerprint())
             self.assertEqual(base.checkpoint_name, same_diff_log.checkpoint_name)
 
-            # Dataset-derived vocab_size mutation for char must not change checkpoint_dir.
+            # Dataset-clamped vocab_size mutation for bpe must not change checkpoint_dir.
             before_dir = base.checkpoint_dir
-            base.vocab_size = 65
+            base.vocab_size = 300
             self.assertEqual(base.checkpoint_dir, before_dir)
+
+            # Changing BPE target vocab size produces distinct token and checkpoint paths.
+            bpe_512 = TrainConfig.auto("cpu", data_path=Path(tmp1), vocab_size=512)
+            self.assertEqual(bpe_512.bpe_vocab_size, 512)
+            self.assertEqual(bpe_512.vocab_size, 512)
+            self.assertEqual(bpe_512.token_dir, Path(tmp1) / "tokens" / "bpe-512")
+            self.assertNotEqual(bpe_512.checkpoint_dir, before_dir)
+
+            # Char tokenizer uses tokens/char and ignores dataset-derived vocab_size.
+            char_cfg = TrainConfig.auto("cpu", data_path=Path(tmp1), tokenizer="char")
+            self.assertEqual(char_cfg.token_dir, Path(tmp1) / "tokens" / "char")
+            char_before = char_cfg.checkpoint_dir
+            char_cfg.vocab_size = 65
+            self.assertEqual(char_cfg.checkpoint_dir, char_before)
+            self.assertNotEqual(char_before, before_dir)
 
             # Hyperparameter change produces a distinct checkpoint directory.
             tuned = TrainConfig.auto("cpu", data_path=Path(tmp1), dropout=0.25)
@@ -152,13 +198,28 @@ class PipelineTests(unittest.TestCase):
                 vocab_size=50257,
             )
             self.assertEqual(gpt2_a.tokenizer, "gpt2")
+            self.assertEqual(gpt2_a.vocab_size, 50304)
             self.assertEqual(gpt2_a.token_dir, Path(tmp1) / "tokens" / "gpt2")
             self.assertEqual(gpt2_a.checkpoint_dir, gpt2_b.checkpoint_dir)
             self.assertNotEqual(gpt2_a.token_dir, base.token_dir)
 
-            # Invalid tokenizer raises ValueError.
+            # Scratch GPT-2 defaults to 50304 vocab size.
+            gpt2_scratch = TrainConfig.auto(
+                "cpu", data_path=Path(tmp1), tokenizer="gpt2"
+            )
+            self.assertEqual(gpt2_scratch.vocab_size, 50304)
+
+            # Legacy char checkpoint config without tokenizer field still infers char.
+            legacy_char = TrainConfig.from_dict(
+                {"init_from": "scratch", "vocab_size": 65}
+            )
+            self.assertEqual(legacy_char.tokenizer, "char")
+
+            # Invalid tokenizer or too-small bpe_vocab_size raises ValueError.
             with self.assertRaises(ValueError):
                 TrainConfig.auto("cpu", tokenizer="unknown")
+            with self.assertRaises(ValueError):
+                TrainConfig.auto("cpu", vocab_size=100)
 
     def test_model_guards_and_from_pretrained_safetensors(self) -> None:
         model = GPT(
@@ -236,7 +297,7 @@ class PipelineTests(unittest.TestCase):
                 log_iters=2,
                 eval_iters=2,
             )
-            save_tensors(cfg, tokenize_char(cfg, ds))
+            save_tensors(cfg, tokenize_bpe(cfg, ds))
             acc = Accelerator(
                 cpu=True, mixed_precision="no", gradient_accumulation_steps=2
             )
@@ -251,6 +312,17 @@ class PipelineTests(unittest.TestCase):
 
             ckpt_cfg, loaded_model = load_checkpoint(ckpt_dir, device="cpu")
             self.assertEqual(ckpt_cfg.checkpoint_dir, ckpt_dir)
+            self.assertEqual(ckpt_cfg.vocab_size, loaded_model.config.vocab_size)
+            self.assertEqual(cfg.vocab_size, loaded_model.config.vocab_size)
+
+            # Sampling from disk resolves the checkpoint's own tokenizer even if caller config differs.
+            char_view = TrainConfig.auto("cpu", data_path=Path(tmp), tokenizer="char")
+            save_tensors(char_view, tokenize_char(char_view, ds))
+            resumed = TrainConfig.auto(
+                "cpu", data_path=Path(tmp), init_from=str(ckpt_dir)
+            )
+            self.assertEqual(resumed.tokenizer, "bpe")
+            self.assertEqual(resumed.bpe_vocab_size, cfg.bpe_vocab_size)
 
             texts = sample(
                 cfg,
@@ -259,6 +331,13 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(len(texts), 1)
             self.assertTrue(texts[0].startswith("First"))
+
+            disk_texts = sample(
+                cfg,
+                SampleConfig(start="First", num_samples=1, max_new_tokens=4, top_k=5),
+            )
+            self.assertEqual(len(disk_texts), 1)
+            self.assertTrue(disk_texts[0].startswith("First"))
 
     def test_ensure_checkpoint_caches_and_isolates_runs(self) -> None:
         ds = {
@@ -372,12 +451,62 @@ class PipelineTests(unittest.TestCase):
             ):
                 train_main()
                 self.assertEqual(spy.call_count, 1)
+                self.assertTrue(
+                    (Path(tmp) / "tokens" / "bpe-1024" / "tokenizer.json").is_file()
+                )
 
             AcceleratorState._reset_state()
             PartialState._reset_state()
             with patch.object(sys, "argv", argv), patch("train.train") as mock_train:
                 train_main()
                 mock_train.assert_not_called()
+
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            bpe_512_argv = [
+                "src/train.py",
+                "--device",
+                "cpu",
+                "--vocab-size",
+                "512",
+                "--data-path",
+                tmp,
+                "--max-iters",
+                "2",
+            ]
+            with (
+                patch.object(sys, "argv", bpe_512_argv),
+                patch("train.ensure_checkpoint") as mock_ensure,
+            ):
+                train_main()
+                called_cfg = mock_ensure.call_args.args[0]
+                self.assertEqual(called_cfg.tokenizer, "bpe")
+                self.assertEqual(called_cfg.bpe_vocab_size, 512)
+                self.assertTrue(
+                    (Path(tmp) / "tokens" / "bpe-512" / "tokenizer.json").is_file()
+                )
+
+            AcceleratorState._reset_state()
+            PartialState._reset_state()
+            char_argv = [
+                "src/train.py",
+                "--device",
+                "cpu",
+                "--tokenizer",
+                "char",
+                "--data-path",
+                tmp,
+                "--max-iters",
+                "2",
+            ]
+            with (
+                patch.object(sys, "argv", char_argv),
+                patch("train.ensure_checkpoint") as mock_ensure,
+            ):
+                train_main()
+                called_cfg = mock_ensure.call_args.args[0]
+                self.assertEqual(called_cfg.tokenizer, "char")
+                self.assertTrue((Path(tmp) / "tokens" / "char" / "meta.json").is_file())
 
             AcceleratorState._reset_state()
             PartialState._reset_state()
@@ -399,6 +528,7 @@ class PipelineTests(unittest.TestCase):
                 train_main()
                 called_cfg = mock_ensure.call_args.args[0]
                 self.assertEqual(called_cfg.tokenizer, "gpt2")
+                self.assertEqual(called_cfg.vocab_size, 50304)
                 self.assertTrue((Path(tmp) / "tokens" / "gpt2" / "meta.json").is_file())
 
 

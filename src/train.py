@@ -14,7 +14,7 @@ from safetensors import safe_open
 from safetensors.torch import load_model
 from torch.utils.data import DataLoader, TensorDataset
 
-from hyperparameters import TrainConfig
+from hyperparameters import _DEFAULT_GPT2_VOCAB_SIZE, _GPT2_MIN_VOCAB_SIZE, TrainConfig
 from model import _PRETRAINED_CONFIGS, GPT, GPTConfig
 from tokenizer import load_tokenizer, prepare_tokens
 
@@ -129,10 +129,10 @@ def _sync_config_from_model(config: TrainConfig, model: GPT) -> None:
 def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
     """Initialize GPT (from scratch, HF GPT-2, or local checkpoint) and AdamW optimizer."""
     if config.init_from == "scratch":
-        if config.tokenizer == "char" and config.meta_path.exists():
+        if config.tokenizer in {"bpe", "char"} and config.meta_path.exists():
             config.vocab_size, _, _ = load_tokenizer(config.meta_path)
-        elif config.tokenizer == "gpt2":
-            config.vocab_size = max(config.vocab_size, 50257)
+        elif config.tokenizer == "gpt2" and config.vocab_size < _GPT2_MIN_VOCAB_SIZE:
+            config.vocab_size = _DEFAULT_GPT2_VOCAB_SIZE
         model = GPT(GPTConfig(**config.model_kwargs()))
     elif config.init_from in _PRETRAINED_CONFIGS:
         model = GPT.from_pretrained(config.init_from, dropout=config.dropout)
@@ -338,7 +338,8 @@ def main() -> None:
     )
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None)
     parser.add_argument("--init-from", default="scratch")
-    parser.add_argument("--tokenizer", choices=("char", "gpt2"), default=None)
+    parser.add_argument("--tokenizer", choices=("bpe", "char", "gpt2"), default=None)
+    parser.add_argument("--vocab-size", type=int, default=None)
     parser.add_argument("--max-iters", type=int, default=None)
     parser.add_argument("--data-path", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -347,6 +348,8 @@ def main() -> None:
     overrides: dict[str, object] = {"init_from": args.init_from}
     if args.tokenizer is not None:
         overrides["tokenizer"] = args.tokenizer
+    if args.vocab_size is not None:
+        overrides["vocab_size"] = args.vocab_size
     if args.max_iters is not None:
         overrides["max_iters"] = args.max_iters
     if args.data_path is not None:

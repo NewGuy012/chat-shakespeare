@@ -10,8 +10,12 @@ import tiktoken
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
 from safetensors.torch import save_file
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from hyperparameters import TrainConfig
+from hyperparameters import _DEFAULT_GPT2_VOCAB_SIZE, TrainConfig
+
+_EOT_TOKEN = "<|endoftext|>"
+_BPE_TOKENIZER_FILE = "tokenizer.json"
 
 
 @lru_cache(maxsize=1)
@@ -82,6 +86,62 @@ def tokenize_char(
     }
 
 
+def tokenize_bpe(
+    config: TrainConfig, ds: DatasetDict | dict[str, Any]
+) -> dict[str, list[int]]:
+    """Train a byte-level BPE tokenizer and tokenize train/val splits."""
+    train_items, val_items = _split_texts(ds)
+    if not any(train_items):
+        raise ValueError("Cannot train BPE tokenizer from empty training dataset")
+
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=config.bpe_vocab_size,
+        special_tokens=[_EOT_TOKEN],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        show_progress=False,
+    )
+    tok.train_from_iterator(train_items, trainer=trainer)
+
+    eot_id = tok.token_to_id(_EOT_TOKEN)
+    if eot_id is None:
+        raise RuntimeError(f"Missing special token {_EOT_TOKEN!r} after BPE training")
+
+    def encode_split(items: list[str]) -> list[int]:
+        ids: list[int] = []
+        for encoding in tok.encode_batch(items):
+            ids.extend(encoding.ids)
+            ids.append(eot_id)
+        return ids
+
+    actual_vocab_size = tok.get_vocab_size()
+    config.tokenizer = "bpe"
+    config.vocab_size = actual_vocab_size
+    print(
+        f"\nTokenize text (bpe): vocab_size={actual_vocab_size:,} "
+        f"(target={config.bpe_vocab_size:,})"
+    )
+
+    config.token_dir.mkdir(parents=True, exist_ok=True)
+    tok_path = config.token_dir / _BPE_TOKENIZER_FILE
+    tok.save(str(tok_path))
+    save_meta(
+        config,
+        {
+            "tokenizer": "bpe",
+            "vocab_size": actual_vocab_size,
+            "bpe_vocab_size": config.bpe_vocab_size,
+            "tokenizer_file": _BPE_TOKENIZER_FILE,
+        },
+    )
+    return {
+        "train": encode_split(train_items),
+        "val": encode_split(val_items),
+    }
+
+
 def tokenize_gpt2(
     config: TrainConfig, ds: DatasetDict | dict[str, Any]
 ) -> dict[str, list[int]]:
@@ -96,7 +156,11 @@ def tokenize_gpt2(
             ids.append(enc.eot_token)
         return ids
 
-    vocab_size = max(config.vocab_size, enc.n_vocab)
+    vocab_size = (
+        config.vocab_size
+        if config.vocab_size >= enc.n_vocab
+        else _DEFAULT_GPT2_VOCAB_SIZE
+    )
     config.tokenizer = "gpt2"
     config.vocab_size = vocab_size
     print(f"\nTokenize text (gpt2): vocab_size={vocab_size:,}")
@@ -137,7 +201,16 @@ def tokens_ready(config: TrainConfig) -> bool:
         meta = json.loads(config.meta_path.read_text(encoding="utf-8"))
     except OSError, json.JSONDecodeError:
         return False
-    return isinstance(meta, dict) and meta.get("tokenizer") == config.tokenizer
+    if not isinstance(meta, dict) or meta.get("tokenizer") != config.tokenizer:
+        return False
+    if config.tokenizer == "bpe":
+        tok_file = meta.get("tokenizer_file")
+        return (
+            isinstance(tok_file, str)
+            and meta.get("bpe_vocab_size") == config.bpe_vocab_size
+            and (config.token_dir / tok_file).is_file()
+        )
+    return True
 
 
 def prepare_tokens(config: TrainConfig, overwrite: bool = False) -> Path:
@@ -147,11 +220,12 @@ def prepare_tokens(config: TrainConfig, overwrite: bool = False) -> Path:
         return config.token_dir
 
     ds = download(config)
-    tokenized = (
-        tokenize_gpt2(config, ds)
-        if config.tokenizer == "gpt2"
-        else tokenize_char(config, ds)
-    )
+    if config.tokenizer == "bpe":
+        tokenized = tokenize_bpe(config, ds)
+    elif config.tokenizer == "gpt2":
+        tokenized = tokenize_gpt2(config, ds)
+    else:
+        tokenized = tokenize_char(config, ds)
     save_tensors(config, tokenized)
     return config.token_dir
 
@@ -162,7 +236,22 @@ def load_tokenizer(
     """Return (vocab_size, encode, decode) from meta.json or default GPT-2 BPE."""
     if meta_path is not None and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("tokenizer") == "char":
+        tok_kind = meta.get("tokenizer")
+        if tok_kind == "bpe":
+            tok_file = meta_path.parent / meta.get(
+                "tokenizer_file", _BPE_TOKENIZER_FILE
+            )
+            tok = Tokenizer.from_file(str(tok_file))
+
+            def encode_bpe(text: str) -> list[int]:
+                return tok.encode(text).ids
+
+            def decode_bpe(ids: list[int]) -> str:
+                return tok.decode(ids, skip_special_tokens=False)
+
+            return tok.get_vocab_size(), encode_bpe, decode_bpe
+
+        if tok_kind == "char":
             chars = meta["chars"]
             stoi = {c: i for i, c in enumerate(chars)}
             itos = {i: c for i, c in enumerate(chars)}
@@ -180,13 +269,13 @@ def load_tokenizer(
 
             return len(chars), encode_char, decode_char
 
-        vocab_size = int(meta.get("vocab_size", 50304))
+        vocab_size = int(meta.get("vocab_size", _DEFAULT_GPT2_VOCAB_SIZE))
     else:
-        vocab_size = 50304
+        vocab_size = _DEFAULT_GPT2_VOCAB_SIZE
 
     enc = _gpt2_encoding()
 
     def encode_gpt2(text: str) -> list[int]:
-        return enc.encode(text, allowed_special={"<|endoftext|>"})
+        return enc.encode(text, allowed_special={_EOT_TOKEN})
 
     return vocab_size, encode_gpt2, enc.decode

@@ -73,30 +73,32 @@ Neural networks can only do math on numbers, not letters. A **tokenizer** is the
 
 The set of all unique symbols a tokenizer knows is its **vocabulary**, and its size is called `vocab_size`.
 
-Chat Shakespeare includes **two tokenizers** so you can compare how educational and production models split text:
+Chat Shakespeare includes **three tokenizers** so you can compare subword, character-level, and pretrained tokenization:
 
-| Feature | Character-level (`tokenize_char`, default) | GPT-2 BPE (`tokenize_gpt2`, via `tiktoken`) |
-| :--- | :--- | :--- |
-| **Unit** | Single characters (`'R'`, `'O'`, `'M'`, `'E'`, `'O'`) | Common subword chunks (`'Sh'`, `'akespeare'`, `' the'`) |
-| **`vocab_size`** | **65** (every unique character in Tiny Shakespeare) | **50,257** (padded to **50,304** for GPU efficiency) |
-| **Sequence length** | Longer (`"Shakespeare"` = 11 tokens) | Shorter (`"Shakespeare"` = 2 tokens) |
-| **Best for** | Training from scratch on a small dataset | Fine-tuning pretrained GPT-2 weights |
+| Feature | Custom Byte-Level BPE (`tokenize_bpe`, default) | Character-level (`tokenize_char`) | GPT-2 BPE (`tokenize_gpt2`, via `tiktoken`) |
+| :--- | :--- | :--- | :--- |
+| **Unit** | Learned Shakespeare subwords (`'ROMEO'`, `' the'`, `'ing'`) | Single characters (`'R'`, `'O'`, `'M'`, `'E'`, `'O'`) | General English subword chunks (`'Sh'`, `'akespeare'`) |
+| **`vocab_size`** | **1,024** (configurable via `--vocab-size`) | **65** (every unique character in Tiny Shakespeare) | **50,257** (padded to **50,304** for GPU efficiency) |
+| **Sequence length** | Medium (~2.4× compression; `"Shakespeare"` = 7 tokens) | Longest (`"Shakespeare"` = 11 tokens) | Shortest (`"Shakespeare"` = 2 tokens) |
+| **Best for** | Training from scratch (default) | Studying character-by-character learning | Fine-tuning pretrained GPT-2 weights |
 
-### Why default to character-level when training from scratch?
-With only 65 possible tokens, the model's lookup tables stay tiny and it sees every token thousands of times during training. With 50,257 subword tokens on a ~1 MB Shakespeare dataset, most tokens would barely appear (or never appear at all).
+### Why default to a 1,024-token Byte-Level BPE when training from scratch?
+A small BPE vocabulary trained directly on Tiny Shakespeare via Hugging Face `tokenizers` gives you the best of both worlds:
+- **~2.4× longer effective context** inside the same `block_size` window compared to character-level tokens.
+- **No wasted parameters or OOV errors:** Unlike GPT-2's 50,257-token table (where most tokens never appear in Shakespeare), every token in a 1,024-token vocabulary is learned directly from the corpus, and byte-level fallback handles any UTF-8 prompt character cleanly.
 
 > **Why pad 50,257 to 50,304?**  
-> GPUs love numbers divisible by 64 for fast matrix multiplication. `50,304 = 786 × 64` is the next clean multiple of 64 above GPT-2's `50,257`.
+> GPUs love numbers divisible by 64 for fast matrix multiplication. `50,304 = 786 × 64` is the next clean multiple of 64 above GPT-2's `50,257` (and `1,024 = 16 × 64` is already a clean multiple of 64!).
 
 ### Train Split vs. Validation Split
-[`src/tokenizer.py`](../src/tokenizer.py) caches each tokenizer under `data/tokens/<tokenizer>/` (so `char` and `gpt2` never overwrite each other) and saves two separate files:
-- `data/tokens/char/train.safetensors` — the text the model studies from.
-- `data/tokens/char/val.safetensors` — text kept **hidden** from training so we can test whether the model is genuinely learning Shakespearean style or just memorizing the training text.
+[`src/tokenizer.py`](../src/tokenizer.py) caches each tokenizer under `data/tokens/<tokenizer>/` (e.g., `bpe-1024`, `char`, `gpt2` so experiments never overwrite each other) and saves separate split files:
+- `data/tokens/bpe-1024/train.safetensors` — the text the model studies from.
+- `data/tokens/bpe-1024/val.safetensors` — text kept **hidden** from training so we can test whether the model is genuinely learning Shakespearean style or just memorizing the training text.
 
-### Why `safetensors` and `meta.json` instead of `pickle`?
+### Why `safetensors` and JSON instead of `pickle`?
 Older tutorials often save data with Python's `pickle`. Pickle files can execute arbitrary code when loaded (a security hazard) and aren't human-readable. This repo uses:
 - **`.safetensors`** for raw numeric tensors (fast, safe, zero arbitrary code execution).
-- **`data/tokens/char/meta.json`** for tokenizer info — open it after running tokenization to see the exact 65-character alphabet!
+- **`data/tokens/bpe-1024/meta.json`** and **`tokenizer.json`** for tokenizer metadata and learned merges — open them after running tokenization to inspect the vocabulary!
 
 ---
 
@@ -289,11 +291,14 @@ How do we score the model's guesses? With **Cross-Entropy Loss** (`F.cross_entro
 - If the model gave the right token a tiny probability ($p = 0.01$), loss = $-\ln(0.01) \approx 4.61$ (big penalty!).
 
 #### Sanity-Check Math You Can Verify Live!
-At step 0, with a 65-character vocabulary and random weights, the model assigns roughly $1/65$ probability to every character:
+At step 0, with random weights and a vocabulary of size $V$, the model assigns roughly $1/V$ probability to every token:
 
-$$\text{Expected initial loss} = -\ln\!\left(\frac{1}{65}\right) = \ln(65) \approx 4.17$$
+$$\text{Expected initial loss} = -\ln\!\left(\frac{1}{V}\right) = \ln(V)$$
 
-When you run training, watch **Step 0** in the logs — it will start right around `4.2`! As training progresses (e.g., 3,000 iterations on Apple Silicon MPS), train loss drops to around `1.14` and validation loss to around `1.50`.
+- With the default **1,024-token BPE** vocabulary: $\ln(1024) \approx 6.93$.
+- With the **65-character** vocabulary (`--tokenizer char`): $\ln(65) \approx 4.17$.
+
+When you run training, watch **Step 0** in the logs — it will start right around that theoretical baseline! *(Note: raw cross-entropy loss rises with larger vocabularies because each step predicts one of $V$ tokens instead of one character, so compare checkpoints with the same tokenizer—or compare bits per byte across tokenizers.)*
 
 #### Watching for Overfitting
 Every `log_iters` steps, [`estimate_loss`](../src/train.py#L158-L185) evaluates the average loss on both `train` and `val` data:
@@ -335,7 +340,7 @@ LR
 
 ### 4.4 Hardware Tricks: Mixed Precision, Accumulation, and Accelerate
 
-> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L346-L357) and [`build_accelerator`](../src/train.py#L22-L37)
+> **Code:** [`TrainConfig.auto`](../src/hyperparameters.py#L394-L448) and [`build_accelerator`](../src/train.py#L22-L37)
 
 Modern LLM training uses a few practical tricks so bigger models run fast on modest hardware — all built right into this repo via [Hugging Face Accelerate](https://huggingface.co/docs/accelerate):
 
@@ -368,7 +373,7 @@ Prompt:  "\nROMEO:"
    - **`1.0`**: samples from the exact learned probabilities.
    - **High (`1.3`–`2.0`)**: flattens probabilities → wilder, more surprising, eventually chaotic gibberish.
 4. **Top-k Filtering (`top_k`, default `200`)**: Keeps only the `k` highest-scoring tokens and sets every other token's logit to `-inf` (probability `0`). This cuts off the "long tail" of bizarre tokens while preserving variety among good candidates.
-   *(Tip: for the 65-character vocabulary, `top_k=200` allows all 65 characters. Try setting `top_k=5` or `top_k=10` to feel its effect directly!)*
+   *(Tip: try setting `top_k=5` or `top_k=10` to feel its effect directly, or `top_k=None` to sample from the full vocabulary!)*
 5. **Multinomial Sampling (`torch.multinomial`)**: Rolls a weighted die according to the final probabilities rather than always picking the single top token, so every run creates a unique scene.
 
 ---
@@ -388,7 +393,7 @@ Train for just **10**, **200**, and **1,000+** iterations and sample after each 
 ```bash
 uv run python src/train.py --max-iters 10
 ```
-- **What to watch:** At step 0, loss starts near $\ln(65) \approx 4.17$ and output is alphabet soup. Within a couple hundred steps, spaces, line breaks, and speaker prefixes (`KING:`, `FIRST CITIZEN:`) appear first. Real words and dramatic cadence emerge later!
+- **What to watch:** At step 0, loss starts near $\ln(1024) \approx 6.93$ (or $\ln(65) \approx 4.17$ with `--tokenizer char`) and output is gibberish. Within a couple hundred steps, spaces, line breaks, and speaker prefixes (`KING:`, `FIRST CITIZEN:`) appear first. Coherent phrases and dramatic cadence emerge later!
 
 ### Experiment 2: Feel Temperature and Top-k (No Retraining Needed!)
 In the sampling cell of [`main.py`](../main.py), keep your already-loaded in-memory checkpoint and try:
@@ -406,7 +411,7 @@ Compare `TrainConfig.auto(block_size=16)` vs. `TrainConfig.auto(block_size=256)`
 
 ### Experiment 5: Open the Artifacts on Disk
 After running once, inspect the plain JSON files created in `data/`:
-- `data/tokens/char/meta.json` — see the exact 65-character vocabulary string.
+- `data/tokens/bpe-1024/meta.json` and `tokenizer.json` — see the learned BPE vocabulary and merges (or `data/tokens/char/meta.json` when using `--tokenizer char`).
 - `data/checkpoints/<run>/config.json` — see every hyperparameter, cache fingerprint, and final train/val losses saved alongside `model.safetensors`.
 
 ### Experiment 6: Fine-Tune Real Pretrained GPT-2 on Shakespeare
@@ -424,18 +429,18 @@ Want to read the entire implementation top to bottom? Here is the gentlest order
 
 | Order | File | Lines | What You'll Learn |
 | :---: | :--- | ---: | :--- |
-| 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 357 | Every knob you can turn, CPU / MPS / CUDA presets, and cache fingerprinting |
-| 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 192 | Downloading Tiny Shakespeare, char vs. GPT-2 BPE encoding, `safetensors` + JSON storage |
+| 1 | [`src/hyperparameters.py`](../src/hyperparameters.py) | 448 | Every knob you can turn, CPU / MPS / CUDA presets, and cache fingerprinting |
+| 2 | [`src/tokenizer.py`](../src/tokenizer.py) | 281 | Downloading Tiny Shakespeare, custom BPE / char / GPT-2 encoding, `safetensors` + JSON storage |
 | 3 | [`src/model.py`](../src/model.py) | 278 | The entire GPT architecture (`CausalSelfAttention`, `MLP`, `Block`, `GPT`, `generate`, `from_pretrained`) |
-| 4 | [`src/train.py`](../src/train.py) | 365 | Shifted `(x, y)` `DataLoader`, cosine LR schedule, `Accelerate` loop, evaluation, checkpointing |
+| 4 | [`src/train.py`](../src/train.py) | 368 | Shifted `(x, y)` `DataLoader`, cosine LR schedule, `Accelerate` loop, evaluation, checkpointing |
 | 5 | [`src/sample.py`](../src/sample.py) | 70 | Loading a saved checkpoint and sampling text with temperature & top-k |
-| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 406 | End-to-end tests exercising every component on a tiny CPU model in seconds |
+| 6 | [`tests/test_pipeline.py`](../tests/test_pipeline.py) | 536 | End-to-end tests exercising every component on a tiny CPU model in seconds |
 
 ---
 
 ## Hyperparameter Cheat Sheet
 
-Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py#L153-L185) and [`SampleConfig`](../src/sample.py#L14-L20):
+Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py#L166-L199) and [`SampleConfig`](../src/sample.py#L14-L20):
 
 | Parameter | Plain-English Meaning | Effect of Increasing It |
 | :--- | :--- | :--- |
@@ -443,7 +448,7 @@ Quick reference for the main fields in [`TrainConfig`](../src/hyperparameters.py
 | `n_head` | Number of parallel attention heads per block | More specialized attention patterns (`n_embd % n_head == 0`) |
 | `n_embd` | Width of each token's feature vector (`C`) | Richer token representations; parameter count grows ~quadratically |
 | `block_size` | Maximum context window length (`T`) | Longer memory; attention cost grows quadratically with `T` |
-| `vocab_size` | Number of unique tokens in the dictionary | Determined by tokenizer (65 for char, 50,257/50,304 for GPT-2) |
+| `vocab_size` | Number of unique tokens in the dictionary | Determined by tokenizer (1,024 default BPE, 65 for char, 50,257/50,304 for GPT-2) |
 | `batch_size` | Number of chunks processed simultaneously (`B`) | Smoother gradients & faster throughput; uses more memory |
 | `gradient_accumulation_steps` | Micro-batches summed before one weight update | Simulates a larger effective batch (`batch_size × accum`) without extra VRAM |
 | `dropout` | Fraction of activations randomly zeroed in training | Reduces overfitting; too high makes learning slow/noisy |

@@ -13,7 +13,12 @@ import torch
 _DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 _VALID_DEVICES = frozenset({"cpu", "mps", "cuda"})
 _VALID_PRECISIONS = frozenset({"no", "fp16", "bf16"})
-_VALID_TOKENIZERS = frozenset({"char", "gpt2"})
+_VALID_TOKENIZERS = frozenset({"bpe", "char", "gpt2"})
+_DEFAULT_TOKENIZER = "bpe"
+_BPE_MIN_VOCAB_SIZE = 257
+_DEFAULT_BPE_VOCAB_SIZE = 1024
+_GPT2_MIN_VOCAB_SIZE = 50257
+_DEFAULT_GPT2_VOCAB_SIZE = 50304
 _PRETRAINED_MODELS = frozenset({"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"})
 _PRETRAINED_BLOCK_SIZE = 1024
 
@@ -39,7 +44,15 @@ def _infer_tokenizer(init_from: str) -> str:
         tok = ckpt_cfg.get("tokenizer")
         if isinstance(tok, str) and tok in _VALID_TOKENIZERS:
             return tok
-    return "char"
+        vocab_size = ckpt_cfg.get("vocab_size")
+        if (
+            ckpt_cfg.get("init_from") == "scratch"
+            and isinstance(vocab_size, int)
+            and not isinstance(vocab_size, bool)
+            and vocab_size < _BPE_MIN_VOCAB_SIZE
+        ):
+            return "char"
+    return _DEFAULT_TOKENIZER
 
 
 def _base_block_size(init_from: str) -> int | None:
@@ -157,14 +170,15 @@ class TrainConfig:
     data_path: Path = field(default_factory=lambda: _DEFAULT_ROOT / "data")
     batch_size: int = 16
     block_size: int = 128
-    vocab_size: int = 50304
+    vocab_size: int = _DEFAULT_BPE_VOCAB_SIZE
     n_layer: int = 4
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.1
     bias: bool = False
     init_from: str = "scratch"
-    tokenizer: str = "char"
+    tokenizer: str = _DEFAULT_TOKENIZER
+    bpe_vocab_size: int = _DEFAULT_BPE_VOCAB_SIZE
     weight_decay: float = 0.1
     learning_rate: float = 1.5e-3
     min_lr: float = 1.5e-4
@@ -208,6 +222,7 @@ class TrainConfig:
             "batch_size",
             "block_size",
             "vocab_size",
+            "bpe_vocab_size",
             "n_layer",
             "n_head",
             "n_embd",
@@ -219,6 +234,11 @@ class TrainConfig:
         for name in positive_ints:
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
+        if self.tokenizer == "bpe" and self.bpe_vocab_size < _BPE_MIN_VOCAB_SIZE:
+            raise ValueError(
+                f"bpe_vocab_size must be >= {_BPE_MIN_VOCAB_SIZE} "
+                f"(256 byte tokens + <|endoftext|>), got {self.bpe_vocab_size}"
+            )
         if (
             self.epoch_iters < 0
             or self.warmup_iters < 0
@@ -231,7 +251,10 @@ class TrainConfig:
 
     @property
     def token_dir(self) -> Path:
-        return self.data_path / "tokens" / self.tokenizer
+        name = (
+            f"bpe-{self.bpe_vocab_size}" if self.tokenizer == "bpe" else self.tokenizer
+        )
+        return self.data_path / "tokens" / name
 
     @property
     def meta_path(self) -> Path:
@@ -288,8 +311,14 @@ class TrainConfig:
                     "bias": bool(self.bias),
                 }
             )
-            if self.tokenizer == "gpt2":
-                payload["vocab_size"] = max(int(self.vocab_size), 50257)
+            if self.tokenizer == "bpe":
+                payload["bpe_vocab_size"] = int(self.bpe_vocab_size)
+            elif self.tokenizer == "gpt2":
+                payload["vocab_size"] = (
+                    int(self.vocab_size)
+                    if int(self.vocab_size) >= _GPT2_MIN_VOCAB_SIZE
+                    else _DEFAULT_GPT2_VOCAB_SIZE
+                )
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )
@@ -298,14 +327,17 @@ class TrainConfig:
     @property
     def checkpoint_name(self) -> str:
         block_size = self._effective_block_size()
+        tok_label = (
+            f"bpe{self.bpe_vocab_size}" if self.tokenizer == "bpe" else self.tokenizer
+        )
         if self.init_from == "scratch":
-            prefix = (
-                f"scratch-{self.tokenizer}-{self.n_layer}l{self.n_embd}d-b{block_size}"
-            )
+            prefix = f"scratch-{tok_label}-{self.n_layer}l{self.n_embd}d-b{block_size}"
         elif self.init_from in _PRETRAINED_MODELS:
-            prefix = f"{self.init_from}-{self.tokenizer}-b{block_size}"
+            prefix = f"{self.init_from}-{tok_label}-b{block_size}"
         else:
-            prefix = f"{_slug_part(Path(self.init_from).name)}-{self.tokenizer}-b{block_size}"
+            prefix = (
+                f"{_slug_part(Path(self.init_from).name)}-{tok_label}-b{block_size}"
+            )
         return f"{prefix}-{self.fingerprint()[:12]}"
 
     @property
@@ -336,11 +368,26 @@ class TrainConfig:
     def from_dict(cls, data: dict[str, Any]) -> TrainConfig:
         valid_fields = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in data.items() if k in valid_fields}
+        if "tokenizer" not in filtered:
+            init_from = filtered.get("init_from")
+            vocab_size = filtered.get("vocab_size")
+            if init_from in _PRETRAINED_MODELS:
+                filtered["tokenizer"] = "gpt2"
+            elif (
+                init_from == "scratch"
+                and isinstance(vocab_size, int)
+                and not isinstance(vocab_size, bool)
+                and vocab_size < _BPE_MIN_VOCAB_SIZE
+            ):
+                filtered["tokenizer"] = "char"
         if (
-            "tokenizer" not in filtered
-            and filtered.get("init_from") in _PRETRAINED_MODELS
+            filtered.get("tokenizer") == "bpe"
+            and "bpe_vocab_size" not in filtered
+            and isinstance(filtered.get("vocab_size"), int)
+            and not isinstance(filtered.get("vocab_size"), bool)
+            and filtered["vocab_size"] >= _BPE_MIN_VOCAB_SIZE
         ):
-            filtered["tokenizer"] = "gpt2"
+            filtered["bpe_vocab_size"] = filtered["vocab_size"]
         return cls(**filtered)
 
     @classmethod
@@ -351,7 +398,51 @@ class TrainConfig:
 
         if "max_iters" in overrides and "lr_decay_iters" not in overrides:
             preset["lr_decay_iters"] = overrides["max_iters"]
+
+        target_tokenizer = (
+            str(overrides["tokenizer"])
+            if "tokenizer" in overrides
+            else (
+                _infer_tokenizer(str(overrides["init_from"]))
+                if "init_from" in overrides
+                else _DEFAULT_TOKENIZER
+            )
+        )
         if "tokenizer" not in overrides and "init_from" in overrides:
-            preset["tokenizer"] = _infer_tokenizer(str(overrides["init_from"]))
+            preset["tokenizer"] = target_tokenizer
+
+        if target_tokenizer == "bpe":
+            ckpt_cfg = (
+                _read_checkpoint_config(str(overrides["init_from"]))
+                if "init_from" in overrides
+                else None
+            )
+            if (
+                ckpt_cfg is not None
+                and ckpt_cfg.get("tokenizer") == "bpe"
+                and "bpe_vocab_size" not in overrides
+                and "vocab_size" not in overrides
+            ):
+                inferred_bpe = ckpt_cfg.get("bpe_vocab_size")
+                if not isinstance(inferred_bpe, int) or isinstance(inferred_bpe, bool):
+                    inferred_bpe = ckpt_cfg.get("vocab_size")
+                if (
+                    isinstance(inferred_bpe, int)
+                    and not isinstance(inferred_bpe, bool)
+                    and inferred_bpe >= _BPE_MIN_VOCAB_SIZE
+                ):
+                    preset["bpe_vocab_size"] = inferred_bpe
+                    preset["vocab_size"] = inferred_bpe
+            elif "vocab_size" in overrides and "bpe_vocab_size" not in overrides:
+                preset["bpe_vocab_size"] = overrides["vocab_size"]
+            elif "bpe_vocab_size" in overrides and "vocab_size" not in overrides:
+                preset["vocab_size"] = overrides["bpe_vocab_size"]
+            elif "vocab_size" not in overrides:
+                preset["vocab_size"] = preset.get(
+                    "bpe_vocab_size", _DEFAULT_BPE_VOCAB_SIZE
+                )
+        elif target_tokenizer == "gpt2" and "vocab_size" not in overrides:
+            preset["vocab_size"] = _DEFAULT_GPT2_VOCAB_SIZE
+
         preset.update(overrides)
         return cls(**preset)
