@@ -4,12 +4,13 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
-from accelerate import PartialState
 
-from hyperparameters import TrainConfig
+from hyperparameters import GPT2_VOCAB_SIZE, TrainConfig, is_int
 from model import GPT
 from tokenizer import load_tokenizer
 from train import load_checkpoint
+
+_AMP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 @dataclass
@@ -20,6 +21,18 @@ class SampleConfig:
     temperature: float = 0.95
     top_k: int | None = 200
 
+    def __post_init__(self) -> None:
+        if not is_int(self.num_samples) or self.num_samples < 0:
+            raise ValueError(f"num_samples must be >= 0, got {self.num_samples!r}")
+        if not is_int(self.max_new_tokens) or self.max_new_tokens < 0:
+            raise ValueError(
+                f"max_new_tokens must be >= 0, got {self.max_new_tokens!r}"
+            )
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
+        if self.top_k is not None and (not is_int(self.top_k) or self.top_k < 1):
+            raise ValueError(f"top_k must be None or >= 1, got {self.top_k!r}")
+
 
 def sample(
     config: TrainConfig,
@@ -27,25 +40,26 @@ def sample(
     model: GPT | None = None,
 ) -> list[str]:
     """Generate text samples from a saved checkpoint or pre-loaded GPT model."""
-    if sample_config.num_samples <= 0:
+    if sample_config.num_samples == 0:
         return []
 
-    state = PartialState(cpu=(config.device == "cpu"))
-    device = state.device if state.device is not None else state.default_device
-
+    device = torch.device(config.device)
+    model_passed = model is not None
     if model is None:
         ckpt_cfg, model = load_checkpoint(config.checkpoint_dir, device=device)
-        meta_path = (
-            ckpt_cfg.meta_path if ckpt_cfg.meta_path.exists() else config.meta_path
-        )
     else:
+        ckpt_cfg = config
         model.to(device)
-        meta_path = config.meta_path if config.meta_path.exists() else None
 
+    if ckpt_cfg.tokenizer == "gpt2" or (
+        model_passed and model.config.vocab_size >= GPT2_VOCAB_SIZE
+    ):
+        meta_path = None
+    else:
+        meta_path = (
+            ckpt_cfg.meta_path if ckpt_cfg.meta_path.is_file() else config.meta_path
+        )
     tok_vocab_size, encode, decode = load_tokenizer(meta_path)
-    if tok_vocab_size < 50257 and model.config.vocab_size >= 50257:
-        # Pretrained GPT-2 models expect GPT-2 BPE even if local meta.json is bpe or char.
-        tok_vocab_size, encode, decode = load_tokenizer(None)
 
     start_ids = encode(sample_config.start)
     if not start_ids:
@@ -54,19 +68,10 @@ def sample(
     if sample_config.num_samples > 1:
         x = x.expand(sample_config.num_samples, -1)
 
-    amp_dtype = (
-        torch.bfloat16
-        if config.mixed_precision == "bf16"
-        else (torch.float16 if config.mixed_precision == "fp16" else None)
-    )
-    use_amp = (
-        amp_dtype is not None
-        and device.type in {"cuda", "mps"}
-        and not (device.type == "mps" and amp_dtype == torch.float16)
-    )
+    amp_dtype = _AMP_DTYPES.get(config.mixed_precision)
     amp_ctx = (
         torch.autocast(device_type=device.type, dtype=amp_dtype)
-        if use_amp and amp_dtype is not None
+        if amp_dtype is not None and device.type in {"cuda", "mps"}
         else nullcontext()
     )
 

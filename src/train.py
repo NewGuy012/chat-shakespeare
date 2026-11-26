@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 import torch
@@ -20,36 +19,34 @@ from accelerate.utils import (
 )
 from safetensors import safe_open
 from safetensors.torch import load_model
-from torch.utils.data import DataLoader, TensorDataset
 
 from hyperparameters import (
     GPT2_VOCAB_SIZE,
     PRETRAINED_CONFIGS,
+    VALID_ARCHS,
+    VALID_COMPILE_MODES,
+    VALID_DEVICES,
+    VALID_TOKENIZERS,
+    VOCAB_ALIGN,
     TrainConfig,
     infer_arch_from_weights,
+    is_int,
     pad_vocab_size,
+    read_json,
+    read_json_dict,
+    read_safetensors_keys,
+    write_json_atomic,
 )
 from model import GPT, GPTConfig
-from tokenizer import load_tokenizer, prepare_tokens
+from tokenizer import prepare_tokens
 
 _MAX_DEVICE_TOKENS_BYTES = 256 * 1024 * 1024
 
 
-def _configure_device_runtime(device: torch.device) -> None:
-    """Enable device-appropriate fast math paths without affecting portability."""
-    if device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
-
-
 def _sync_device(device: torch.device) -> None:
-    """Synchronize asynchronous device execution for accurate step timing."""
     if device.type == "cuda":
         torch.cuda.synchronize()
-    elif (
-        device.type == "mps"
-        and hasattr(torch, "mps")
-        and hasattr(torch.mps, "synchronize")
-    ):
+    elif device.type == "mps" and hasattr(torch, "mps"):
         torch.mps.synchronize()
 
 
@@ -61,10 +58,9 @@ def build_accelerator(config: TrainConfig) -> Accelerator:
     effective_mp = os.environ.get("ACCELERATE_MIXED_PRECISION", mixed_precision)
     dynamo_plugin = None
     if "ACCELERATE_DYNAMO_BACKEND" not in os.environ and config.compile:
-        effective_mode = config.compile_mode if config.device == "cuda" else "default"
         dynamo_plugin = TorchDynamoPlugin(
             backend=DynamoBackend.INDUCTOR,
-            mode=effective_mode,
+            mode=config.compile_mode if config.device == "cuda" else "default",
         )
     kwargs_handlers = None
     if config.device == "cuda":
@@ -90,13 +86,14 @@ def build_accelerator(config: TrainConfig) -> Accelerator:
 
 
 class TokenBatcher:
-    """Vectorized on-device batch sampler avoiding per-step CPU-GPU transfers."""
+    """Vectorized batch sampler keeping small splits on-device and large splits on CPU."""
 
     def __init__(
         self,
         tokens: torch.Tensor,
         batch_size: int,
         block_size: int,
+        target_device: torch.device,
         num_processes: int = 1,
         seed: int | None = None,
     ) -> None:
@@ -104,17 +101,27 @@ class TokenBatcher:
             raise ValueError(
                 f"Split length ({len(tokens)}) is too short for block_size={block_size}"
             )
-        self.tokens = tokens
+        self.on_device = tokens.nbytes <= _MAX_DEVICE_TOKENS_BYTES
+        self.tokens = (
+            tokens.to(device=target_device, dtype=torch.long)
+            if self.on_device
+            else tokens
+        )
+        self.target_device = target_device
         self.batch_size = batch_size
         self.block_size = block_size
         self.max_start = len(tokens) - block_size
-        self.offsets = torch.arange(block_size, dtype=torch.long, device=tokens.device)
+        self.offsets = torch.arange(
+            block_size, dtype=torch.long, device=self.tokens.device
+        )
         n_blocks = (len(tokens) - 1) // block_size
         self.epoch_batches = max(1, n_blocks // max(1, batch_size * num_processes))
         self.seed = seed
-        self._train_gen: torch.Generator | None = None
-        if seed is not None:
-            self._train_gen = torch.Generator(device=tokens.device).manual_seed(seed)
+        self._train_gen = (
+            torch.Generator(device=self.tokens.device).manual_seed(seed)
+            if seed is not None
+            else None
+        )
 
     def _sample_batch(
         self, generator: torch.Generator | None
@@ -127,7 +134,17 @@ class TokenBatcher:
             generator=generator,
         )
         idx = starts[:, None] + self.offsets[None, :]
-        return self.tokens[idx], self.tokens[idx + 1]
+        x = self.tokens[idx]
+        y = self.tokens[idx + 1]
+        if not self.on_device:
+            non_blocking = self.target_device.type == "cuda"
+            x = x.to(
+                device=self.target_device, dtype=torch.long, non_blocking=non_blocking
+            )
+            y = y.to(
+                device=self.target_device, dtype=torch.long, non_blocking=non_blocking
+            )
+        return x, y
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._sample_batch(self._train_gen)
@@ -135,96 +152,36 @@ class TokenBatcher:
     def iter_eval(
         self, num_batches: int
     ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        eval_gen: torch.Generator | None = None
-        if self.seed is not None:
-            eval_gen = torch.Generator(device=self.tokens.device).manual_seed(self.seed)
+        eval_gen = (
+            torch.Generator(device=self.tokens.device).manual_seed(self.seed)
+            if self.seed is not None
+            else None
+        )
         for _ in range(num_batches):
             yield self._sample_batch(eval_gen)
 
 
-def _load_split_tensor(config: TrainConfig, split: str) -> torch.Tensor:
+def _build_batcher(
+    config: TrainConfig, accelerator: Accelerator, split: str
+) -> TokenBatcher:
     file_path = config.train_path if split == "train" else config.val_path
     with safe_open(file_path, framework="pt", device="cpu") as f:
-        return f.get_tensor(split)
-
-
-def build_dataloader(
-    config: TrainConfig,
-    split: str,
-    pin_memory: bool = False,
-    shuffle: bool = True,
-    drop_last: bool = False,
-) -> DataLoader:
-    """Load split tokens on CPU and return a DataLoader of (x, y) context windows."""
-    data = _load_split_tensor(config, split)
-    n_blocks = (len(data) - 1) // config.block_size
-    if n_blocks < 1:
-        raise ValueError(
-            f"Split {split!r} length ({len(data)}) is too short for block_size={config.block_size}"
-        )
-
-    n_tokens = n_blocks * config.block_size
-    x = data[:n_tokens].view(n_blocks, config.block_size)
-    y = data[1 : n_tokens + 1].view(n_blocks, config.block_size)
-    return DataLoader(
-        TensorDataset(x, y),
+        data = f.get_tensor(split)
+    seed = (
+        None
+        if config.seed is None
+        else config.seed
+        + accelerator.process_index * 1000
+        + (0 if split == "train" else 1)
+    )
+    return TokenBatcher(
+        data,
         batch_size=config.batch_size,
-        shuffle=shuffle,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
+        block_size=config.block_size,
+        target_device=accelerator.device,
+        num_processes=accelerator.num_processes,
+        seed=seed,
     )
-
-
-def _build_batch_source(
-    config: TrainConfig,
-    accelerator: Accelerator,
-    split: str,
-    shuffle: bool,
-) -> TokenBatcher | DataLoader:
-    data = _load_split_tensor(config, split)
-    if data.nbytes <= _MAX_DEVICE_TOKENS_BYTES:
-        seed = (
-            None
-            if config.seed is None
-            else config.seed
-            + accelerator.process_index * 1000
-            + (0 if split == "train" else 1)
-        )
-        tokens = data.to(device=accelerator.device, dtype=torch.long)
-        return TokenBatcher(
-            tokens,
-            batch_size=config.batch_size,
-            block_size=config.block_size,
-            num_processes=accelerator.num_processes,
-            seed=seed,
-        )
-
-    n_blocks = (len(data) - 1) // config.block_size
-    drop_last = n_blocks >= config.batch_size * accelerator.num_processes
-    loader = build_dataloader(
-        config,
-        split,
-        pin_memory=(accelerator.device.type == "cuda"),
-        shuffle=shuffle,
-        drop_last=drop_last,
-    )
-    return accelerator.prepare(loader)
-
-
-def _cycle_batches(
-    source: TokenBatcher | DataLoader,
-) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-    if isinstance(source, TokenBatcher):
-        while True:
-            yield source.next_batch()
-    epoch = 0
-    while True:
-        sampler = getattr(source, "sampler", None)
-        set_epoch = getattr(sampler, "set_epoch", None)
-        if callable(set_epoch):
-            set_epoch(epoch)
-        yield from source
-        epoch += 1
 
 
 def get_lr(config: TrainConfig, step: int) -> float:
@@ -252,13 +209,18 @@ def load_checkpoint(
     checkpoint_dir = Path(checkpoint_dir)
     config_file = checkpoint_dir / "config.json"
     weights_file = checkpoint_dir / "model.safetensors"
-    if not config_file.exists() or not weights_file.exists():
+    if not config_file.is_file() or not weights_file.is_file():
         raise FileNotFoundError(f"Incomplete checkpoint in {checkpoint_dir}")
 
-    cfg = TrainConfig.from_dict(json.loads(config_file.read_text(encoding="utf-8")))
+    saved = read_json_dict(config_file)
     arch = infer_arch_from_weights(weights_file)
-    if arch is not None:
-        cfg.arch = arch
+    if arch is None:
+        raise ValueError(f"Invalid safetensors weights in {checkpoint_dir}")
+    saved["arch"] = arch
+    if "data_path" not in saved and checkpoint_dir.parent.name == "checkpoints":
+        saved["data_path"] = checkpoint_dir.parent.parent
+
+    cfg = TrainConfig.from_dict(saved)
     if dropout is not None:
         cfg.dropout = dropout
     model = GPT(GPTConfig(**cfg.model_kwargs()))
@@ -272,37 +234,44 @@ def load_checkpoint(
 
 
 def _sync_config_from_model(config: TrainConfig, model: GPT) -> None:
-    config.block_size = model.config.block_size
-    config.vocab_size = model.config.vocab_size
-    config.n_layer = model.config.n_layer
-    config.n_head = model.config.n_head
-    config.n_embd = model.config.n_embd
-    config.bias = model.config.bias
-    config.arch = model.config.arch
+    for field_name in (
+        "block_size",
+        "vocab_size",
+        "n_layer",
+        "n_head",
+        "n_embd",
+        "bias",
+        "arch",
+    ):
+        setattr(config, field_name, getattr(model.config, field_name))
 
 
 def initialize_model(config: TrainConfig) -> tuple[GPT, torch.optim.Optimizer]:
     """Initialize GPT (from scratch, HF GPT-2, or local checkpoint) and AdamW optimizer."""
     if config.init_from == "scratch":
         if config.tokenizer in {"bpe", "char"} and config.meta_path.exists():
-            tok_vocab, _, _ = load_tokenizer(config.meta_path)
-            config.vocab_size = pad_vocab_size(tok_vocab, 64)
+            meta = read_json_dict(config.meta_path)
+            tok_vocab = meta.get("vocab_size")
+            if not is_int(tok_vocab) or tok_vocab < 1:
+                raise ValueError(
+                    f"Invalid vocab_size in {config.meta_path}: {tok_vocab!r}"
+                )
+            config.vocab_size = pad_vocab_size(tok_vocab, VOCAB_ALIGN)
         elif config.tokenizer == "gpt2":
-            base_vocab = max(config.vocab_size, GPT2_VOCAB_SIZE)
-            config.vocab_size = pad_vocab_size(base_vocab, 64)
+            config.vocab_size = pad_vocab_size(
+                max(config.vocab_size, GPT2_VOCAB_SIZE), VOCAB_ALIGN
+            )
         else:
-            config.vocab_size = pad_vocab_size(config.vocab_size, 64)
+            config.vocab_size = pad_vocab_size(config.vocab_size, VOCAB_ALIGN)
         model = GPT(GPTConfig(**config.model_kwargs()))
-    elif config.init_from in PRETRAINED_CONFIGS:
-        model = GPT.from_pretrained(config.init_from, dropout=config.dropout)
-        if config.block_size < model.config.block_size:
-            model.crop_block_size(config.block_size)
-        _sync_config_from_model(config, model)
     else:
-        ckpt_dir = Path(config.init_from)
-        if not ckpt_dir.is_dir():
-            raise ValueError(f"Unknown init_from value {config.init_from!r}")
-        _, model = load_checkpoint(ckpt_dir, dropout=config.dropout)
+        if config.init_from in PRETRAINED_CONFIGS:
+            model = GPT.from_pretrained(config.init_from, dropout=config.dropout)
+        else:
+            ckpt_dir = Path(config.init_from)
+            if not ckpt_dir.is_dir():
+                raise ValueError(f"Unknown init_from value {config.init_from!r}")
+            _, model = load_checkpoint(ckpt_dir, dropout=config.dropout)
         if config.block_size < model.config.block_size:
             model.crop_block_size(config.block_size)
         _sync_config_from_model(config, model)
@@ -318,32 +287,21 @@ def estimate_loss(
     config: TrainConfig,
     accelerator: Accelerator,
     model: torch.nn.Module,
-    loaders: dict[str, TokenBatcher | DataLoader],
+    loaders: dict[str, TokenBatcher],
 ) -> dict[str, float]:
-    """Evaluate mean cross-entropy loss across train and val batch sources."""
+    """Evaluate mean cross-entropy loss across train and val batchers."""
     out: dict[str, float] = {}
     was_training = model.training
     model.eval()
     try:
         for split, loader in loaders.items():
             batch_losses: list[torch.Tensor] = []
-            batch_iter: Iterable[tuple[torch.Tensor, torch.Tensor]] = (
-                loader.iter_eval(config.eval_iters)
-                if isinstance(loader, TokenBatcher)
-                else loader
-            )
-            for step, (x, y) in enumerate(batch_iter):
-                if step >= config.eval_iters:
-                    break
+            for x, y in loader.iter_eval(config.eval_iters):
                 with accelerator.autocast():
                     _, loss = model(x, y, return_logits=False)
                 batch_losses.append(loss.detach())
-            if batch_losses:
-                local_mean = torch.stack(batch_losses).mean()
-                reduced = accelerator.reduce(local_mean, reduction="mean")
-                out[split] = float(reduced.item())
-            else:
-                out[split] = float("nan")
+            local_mean = torch.stack(batch_losses).mean()
+            out[split] = float(accelerator.reduce(local_mean, reduction="mean").item())
     finally:
         if was_training:
             model.train()
@@ -356,12 +314,13 @@ def train(
 ) -> tuple[Accelerator, torch.nn.Module, dict[str, float]]:
     """Train GPT with Hugging Face Accelerate across CPU, MPS, or single/multi-GPU."""
     accelerator = accelerator or build_accelerator(config)
-    _configure_device_runtime(accelerator.device)
+    if accelerator.device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     if config.seed is not None:
         set_seed(config.seed)
 
-    train_source = _build_batch_source(config, accelerator, "train", shuffle=True)
-    val_source = _build_batch_source(config, accelerator, "val", shuffle=False)
+    train_source = _build_batcher(config, accelerator, "train")
+    val_source = _build_batcher(config, accelerator, "val")
 
     model, optimizer = initialize_model(config)
     accelerator.print(
@@ -369,20 +328,9 @@ def train(
         f"(arch={model.config.arch}, mixed_precision={accelerator.mixed_precision}, "
         f"params={model.get_num_params() / 1e6:.2f}M)"
     )
-
     model, optimizer = accelerator.prepare(model, optimizer)
-    epoch_batches = (
-        train_source.epoch_batches
-        if isinstance(train_source, TokenBatcher)
-        else len(train_source)
-    )
-    max_iters = (
-        epoch_batches * config.epoch_iters
-        if config.epoch_iters > 0
-        else config.max_iters
-    )
     accelerator.print(
-        f"\t1 epoch = {epoch_batches} batches; running {max_iters} iterations."
+        f"\t1 epoch = {train_source.epoch_batches} batches; running {config.max_iters} iterations."
     )
 
     losses: dict[str, float] = {}
@@ -393,14 +341,13 @@ def train(
     best_losses: dict[str, float] | None = None
     improved_last = False
 
-    batch_iter = _cycle_batches(train_source)
     model.train()
     _sync_device(accelerator.device)
     t_log = time.perf_counter()
     last_log_iter = 0
 
-    for iter_num in range(max_iters):
-        x, y = next(batch_iter)
+    for iter_num in range(config.max_iters):
+        x, y = train_source.next_batch()
         with accelerator.accumulate(model):
             with accelerator.autocast():
                 _, loss = model(x, y, return_logits=False)
@@ -418,7 +365,7 @@ def train(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        if iter_num % config.log_iters == 0 or iter_num == max_iters - 1:
+        if iter_num % config.log_iters == 0 or iter_num == config.max_iters - 1:
             _sync_device(accelerator.device)
             dt = max(time.perf_counter() - t_log, 1e-9)
             norm = float(norm_tensor.item()) if norm_tensor is not None else 0.0
@@ -489,7 +436,7 @@ def save_checkpoint(
     losses: dict[str, float] | None = None,
     checkpoint_dir: Path | None = None,
 ) -> Path:
-    """Save unwrapped safetensors weights and JSON config via Accelerate."""
+    """Save unwrapped safetensors weights and atomic JSON config via Accelerate."""
     target_dir = (
         Path(checkpoint_dir) if checkpoint_dir is not None else config.checkpoint_dir
     )
@@ -499,15 +446,14 @@ def save_checkpoint(
         target_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
     accelerator.save_model(unwrapped, target_dir, safe_serialization=True)
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         meta = {
             **config.to_dict(),
             "fingerprint": config.fingerprint(),
             "losses": losses or {},
         }
-        (target_dir / "config.json").write_text(
-            json.dumps(meta, indent=2), encoding="utf-8"
-        )
+        write_json_atomic(target_dir / "config.json", meta)
     accelerator.wait_for_everyone()
     return target_dir
 
@@ -516,19 +462,13 @@ def checkpoint_ready(
     config: TrainConfig,
     checkpoint_dir: Path | None = None,
 ) -> bool:
-    """Return True when a complete checkpoint matching config's fingerprint exists."""
+    """Return True when valid weights and matching config.json exist."""
     target_dir = (
         Path(checkpoint_dir) if checkpoint_dir is not None else config.checkpoint_dir
     )
-    weights_file = target_dir / "model.safetensors"
-    config_file = target_dir / "config.json"
-    if not weights_file.is_file() or not config_file.is_file():
-        return False
-    try:
-        saved = json.loads(config_file.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
-        return False
-    if not isinstance(saved, dict):
+    keys = read_safetensors_keys(target_dir / "model.safetensors")
+    saved = read_json(target_dir / "config.json")
+    if not keys or saved is None:
         return False
     saved_fp = saved.get("fingerprint")
     if isinstance(saved_fp, str):
@@ -561,53 +501,51 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train Chat Shakespeare with Accelerate"
     )
-    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None)
-    parser.add_argument("--arch", choices=("modern", "gpt2"), default=None)
+    parser.add_argument("--device", choices=VALID_DEVICES, default=None)
+    parser.add_argument("--arch", choices=VALID_ARCHS, default=None)
     parser.add_argument("--init-from", default="scratch")
-    parser.add_argument("--tokenizer", choices=("bpe", "char", "gpt2"), default=None)
+    parser.add_argument("--tokenizer", choices=VALID_TOKENIZERS, default=None)
     parser.add_argument("--vocab-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--grad-accum", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--max-iters", type=int, default=None)
-    parser.add_argument(
-        "--compile-mode",
-        choices=("default", "reduce-overhead", "max-autotune"),
-        default=None,
-    )
+    parser.add_argument("--compile-mode", choices=VALID_COMPILE_MODES, default=None)
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--early-stopping", type=int, default=None)
     parser.add_argument("--data-path", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
+    if (
+        args.init_from != "scratch"
+        and args.init_from not in PRETRAINED_CONFIGS
+        and not Path(args.init_from).is_dir()
+    ):
+        parser.error(f"Unknown --init-from checkpoint path: {args.init_from!r}")
+
+    arg_map = {
+        "arch": "arch",
+        "tokenizer": "tokenizer",
+        "vocab_size": "vocab_size",
+        "batch_size": "batch_size",
+        "grad_accum": "gradient_accumulation_steps",
+        "block_size": "block_size",
+        "lr": "learning_rate",
+        "max_iters": "max_iters",
+        "compile_mode": "compile_mode",
+        "early_stopping": "early_stopping_patience",
+        "data_path": "data_path",
+    }
     overrides: dict[str, object] = {"init_from": args.init_from}
-    if args.arch is not None:
-        overrides["arch"] = args.arch
-    if args.tokenizer is not None:
-        overrides["tokenizer"] = args.tokenizer
-    if args.vocab_size is not None:
-        overrides["vocab_size"] = args.vocab_size
-    if args.batch_size is not None:
-        overrides["batch_size"] = args.batch_size
-    if args.grad_accum is not None:
-        overrides["gradient_accumulation_steps"] = args.grad_accum
-    if args.block_size is not None:
-        overrides["block_size"] = args.block_size
-    if args.lr is not None:
-        overrides["learning_rate"] = args.lr
-        overrides["min_lr"] = args.lr * 0.1
-    if args.max_iters is not None:
-        overrides["max_iters"] = args.max_iters
-    if args.compile_mode is not None:
-        overrides["compile_mode"] = args.compile_mode
+    for arg_name, field_name in arg_map.items():
+        val = getattr(args, arg_name)
+        if val is not None:
+            overrides[field_name] = val
     if args.no_compile:
         overrides["compile"] = False
-    if args.early_stopping is not None:
-        overrides["early_stopping_patience"] = args.early_stopping
-    if args.data_path is not None:
-        overrides["data_path"] = args.data_path
+
     config = TrainConfig.auto(device=args.device, **overrides)
     accelerator = build_accelerator(config)
 

@@ -282,7 +282,6 @@ class TrainConfig:
     beta2: float = 0.99
     grad_clip: float = 1.0
     max_iters: int = 1000
-    epoch_iters: int = 0
     warmup_iters: int = 50
     lr_decay_iters: int = 1000
     device: str = "cpu"
@@ -333,7 +332,6 @@ class TrainConfig:
             if not is_int(val) or val < 1:
                 raise ValueError(f"{name} must be an integer >= 1, got {val!r}")
         for name in (
-            "epoch_iters",
             "warmup_iters",
             "lr_decay_iters",
             "early_stopping_patience",
@@ -421,8 +419,7 @@ class TrainConfig:
             "beta1": float(self.beta1),
             "beta2": float(self.beta2),
             "grad_clip": float(self.grad_clip),
-            "max_iters": int(self.max_iters) if self.epoch_iters == 0 else None,
-            "epoch_iters": int(self.epoch_iters),
+            "max_iters": int(self.max_iters),
             "warmup_iters": int(self.warmup_iters),
             "lr_decay_iters": int(self.lr_decay_iters),
             "mixed_precision": self.mixed_precision,
@@ -490,9 +487,10 @@ class TrainConfig:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            k: str(v) if isinstance(v, Path) else v for k, v in asdict(self).items()
-        }
+        out = {k: v for k, v in asdict(self).items() if k != "data_path"}
+        if out["init_from"] != "scratch" and out["init_from"] not in PRETRAINED_CONFIGS:
+            out["init_from"] = Path(str(out["init_from"])).name
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TrainConfig:
