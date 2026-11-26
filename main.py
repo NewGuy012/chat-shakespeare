@@ -6,8 +6,8 @@ app = marimo.App(width="full", sql_output="native")
 with app.setup:
     from hyperparameters import TrainConfig
     from sample import SampleConfig, sample
-    from tokenizer import download, save_tensors, tokenize_char, tokenize_gpt2
-    from train import save_checkpoint, train
+    from tokenizer import prepare_tokens
+    from train import ensure_checkpoint, load_checkpoint
 
 
 @app.cell
@@ -20,48 +20,33 @@ def _():
 
 @app.cell
 def _(config):
-    overwrite = False
-    tokenize(config, overwrite=overwrite)
-    checkpoint_dir = training(config, overwrite=overwrite)
+    overwrite_tokens = False
+    token_dir = prepare_tokens(config, overwrite=overwrite_tokens)
+    return (token_dir,)
+
+
+@app.cell
+def _(config, token_dir):
+    _ = token_dir
+    overwrite_training = False
+    checkpoint_dir = ensure_checkpoint(config, overwrite=overwrite_training)
     return (checkpoint_dir,)
 
 
 @app.cell
 def _(checkpoint_dir, config):
+    _, model = load_checkpoint(checkpoint_dir, device=config.device)
+    return (model,)
+
+
+@app.cell
+def _(config, model):
     sample_config = SampleConfig(
         num_samples=1,
         max_new_tokens=500,
     )
-    sample(config, sample_config)
+    sample(config, sample_config, model=model)
     return
-
-
-@app.function
-def tokenize(config, overwrite=False):
-    ready = (
-        config.train_path.exists()
-        and config.val_path.exists()
-        and config.meta_path.exists()
-    )
-    if overwrite or not ready:
-        ds = download(config)
-        tokenized = (
-            tokenize_gpt2(config, ds)
-            if config.init_from.startswith("gpt2")
-            else tokenize_char(config, ds)
-        )
-        save_tensors(config, tokenized)
-
-
-@app.function
-def training(config, overwrite=False):
-    ckpt_ready = (config.checkpoint_dir / "model.safetensors").exists() and (
-        config.checkpoint_dir / "config.json"
-    ).exists()
-    if overwrite or not ckpt_ready:
-        accelerator, model, losses = train(config)
-        save_checkpoint(config, accelerator, model, losses)
-    return config.checkpoint_dir
 
 
 if __name__ == "__main__":
