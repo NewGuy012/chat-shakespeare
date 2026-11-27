@@ -13,6 +13,7 @@
   <img src="https://img.shields.io/badge/safetensors-%3E%3D0.8-0EA5E9" alt="safetensors >=0.8" />
   <img src="https://img.shields.io/badge/marimo-%3E%3D0.26-1C7D78" alt="marimo >=0.26" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--2--Clause-2563EB" alt="BSD-2-Clause License" /></a>
+  <a href="https://molab.marimo.io/github/NewGuy012/chat-shakespeare/blob/master/main.py"><img src="https://marimo.io/molab-shield.svg" alt="Open in molab" /></a>
 </p>
 
 - **Notebook or terminal**: Run [`main.py`](main.py) as an interactive notebook to explore each step, or run [`src/train.py`](src/train.py) in your terminal.
@@ -39,7 +40,7 @@ uv sync
 uv run marimo edit main.py
 ```
 
-This opens a 5-step notebook that downloads Shakespeare, prepares the text, trains your model, and writes sample dialogue. You can change the starting prompt or creativity (`temperature`) in the last cell anytime without retraining—saved progress is reused automatically.
+This opens a 5-step notebook that downloads Shakespeare, prepares the text, trains your model, and writes sample dialogue. You can change the starting prompt or creativity (`temperature`) in the last cell anytime without retraining—saved progress is reused automatically. Or view/open [`main.py` in marimo molab](https://molab.marimo.io/github/NewGuy012/chat-shakespeare/blob/master/main.py).
 
 ### 3. Or Train & Generate in the Terminal
 
