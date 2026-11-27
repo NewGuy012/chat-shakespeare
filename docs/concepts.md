@@ -26,6 +26,12 @@ You don't need a PhD or a heavy math background to follow along. If you know bas
   - [4.4 Hardware Tricks: Presets, Mixed Precision, Accumulation, and Accelerate](#44-hardware-tricks-presets-mixed-precision-accumulation-and-accelerate)
   - [4.5 Smart Caching and Portable Checkpoints](#45-smart-caching-and-portable-checkpoints)
 - [Step 5: Sampling (Generating New Shakespeare)](#step-5-sampling-generating-new-shakespeare)
+- [Beyond Chat Shakespeare: How Frontier LLMs Like Gemini 4 Are Trained](#beyond-chat-shakespeare-how-frontier-llms-like-gemini-4-are-trained)
+  - [Pretraining at Frontier Scale: Data, Long Context, and Multimodality](#pretraining-at-frontier-scale-data-long-context-and-multimodality)
+  - [Supervised Fine-Tuning (SFT): Turning Autocomplete into a Conversation](#supervised-fine-tuning-sft-turning-autocomplete-into-a-conversation)
+  - [Post-Training with Reinforcement Learning: Alignment and Reasoning](#post-training-with-reinforcement-learning-alignment-and-reasoning)
+  - [Latest Neural Network Architectures: MoE, Smarter Attention, and Beyond](#latest-neural-network-architectures-moe-smarter-attention-and-beyond)
+  - [From Model to Agent: Harnesses, MCP, Skills, and Orchestration](#from-model-to-agent-harnesses-mcp-skills-and-orchestration)
 - [Learn by Doing: 6 Hands-On Experiments](#learn-by-doing-6-hands-on-experiments)
 - [Code Reading Map](#code-reading-map)
 - [Hyperparameter Cheat Sheet](#hyperparameter-cheat-sheet)
@@ -449,6 +455,105 @@ Prompt:  "\nROMEO:"
 5. **Top-k Filtering (`top_k`, default `200`)**: Keeps only the `k` highest-scoring valid tokens and sets every other token's logit to `-inf` (probability `0`). This cuts off the "long tail" of bizarre tokens while preserving variety among good candidates.
    *(Tip: try setting `top_k=5` or `top_k=10` to feel its effect directly, or `top_k=None` to sample from the full vocabulary!)*
 6. **Multinomial Sampling (`torch.multinomial`)**: Rolls a weighted die according to the final probabilities rather than always picking the single top token, so every run creates a unique scene.
+
+---
+
+## Beyond Chat Shakespeare: How Frontier LLMs Like Gemini 4 Are Trained
+
+Everything you have built so far in Steps 1–5 is **Stage 1 (Pretraining)**: teaching a Transformer to predict the next token from raw text. The result is called a **base model**.
+
+A base model is a powerful autocomplete engine, not yet a conversational assistant. Give Chat Shakespeare `"ROMEO:\n"` and it happily continues a play; give a base model `"What is the capital of France?"` and it might just autocomplete `"What is the capital of Spain?"` like a list of quiz questions!
+
+Frontier LLMs like **Gemini 4** start with this exact same next-token prediction foundation — and then expand it across **scale**, **post-training stages**, **newer neural network architectures**, and the **agent software ecosystem** wrapped around the model:
+
+```mermaid
+flowchart LR
+    A["1. Pretraining (Chat Shakespeare stops here)"] --> B["2. Supervised Fine-Tuning (SFT)"]
+    B --> C["3. RL (Alignment and Reasoning)"]
+    C --> D["Frontier LLM (e.g., Gemini 4)"]
+    D --> E["Agent System (Harness, MCP, Skills)"]
+```
+
+Before diving into each upgrade, here is how Chat Shakespeare compares side-by-side with a modern frontier model:
+
+| Dimension | Chat Shakespeare (This Repo) | Frontier LLMs (e.g., Gemini 4) |
+| :--- | :--- | :--- |
+| **Training stage** | Pretraining only (base model) | Pretraining + Long-context + SFT + Reinforcement Learning |
+| **Training data** | ~1.1 MB of Tiny Shakespeare (~0.3M–1.1M tokens) | Trillions of curated tokens across web text, code, math, images, audio, and video |
+| **Modalities** | Text only | **Natively multimodal** (text, images, audio, video, PDFs in one model) |
+| **Context window (`block_size`)** | 128–256 tokens (a few paragraphs) | Up to **1 million tokens** (entire codebases, books, or hours of video) |
+| **Architecture** | Small **dense** GPT (~1M–11M params; `RMSNorm`, RoPE, QK-Norm, `ReLU²`) | Large **Sparse Mixture-of-Experts (MoE)** + memory-efficient attention |
+| **Interaction style** | Raw text completion (`prompt → continuation`) | Multi-turn chat, instruction following, tool use, and step-by-step "thinking" |
+| **Hardware** | 1 laptop CPU, Apple Silicon, or 1–8 GPUs | Clusters of thousands of specialized GPUs or TPUs |
+
+### Pretraining at Frontier Scale: Data, Long Context, and Multimodality
+
+At its core, pretraining a frontier model like Gemini 4 runs the exact same next-token cross-entropy loss as [`src/train.py`](../src/train.py) — just scaled up dramatically in four ways:
+
+- **Curated, Trillion-Token Datasets**: Instead of one 1.1 MB play collection, frontier teams assemble trillions of tokens from web pages, books, scientific papers, math derivations, and source code across hundreds of languages. Huge engineering effort goes into **filtering, deduplication, and data mixing** — because cleaner, more diverse data often matters more than raw size.
+- **Distributed Parallelism Across Thousands of Chips**: Chat Shakespeare uses [`build_accelerator()`](../src/train.py#L53-L85) for **Data Parallelism** (each GPU holds a full copy of the model and processes a different batch). Frontier models are far too big for one chip, so training combines Data Parallelism with **Tensor Parallelism** (splitting single matrix multiplications across chips), **Pipeline Parallelism** (placing different layers on different chips), and **FSDP / ZeRO** (sharding weights and optimizer states across the cluster).
+- **Mid-Training & Million-Token Context Windows**: Training every step at 1,000,000 tokens from day one would be painfully slow. Instead, models typically pretrain first on shorter chunks (e.g., 4k–32k tokens) and then run a **long-context extension** phase — adjusting RoPE frequencies and feeding long repositories, documents, and videos so the model learns to track details across up to a million tokens at once.
+- **Native Multimodality**: In Step 1, [`src/tokenizer.py`](../src/tokenizer.py) turned text into integer token IDs. Frontier models like Gemini 4 generalize that idea so **images, audio clips, video frames, and documents are all converted into tokens** inside the exact same Transformer. Rather than stitching a separate vision model onto a text model afterward, the network learns text, vision, and audio together in one shared representation space.
+
+### Supervised Fine-Tuning (SFT): Turning Autocomplete into a Conversation
+
+Once pretraining finishes, the model knows an enormous amount about language, facts, and code — it just doesn't know how to hold a helpful back-and-forth conversation. **Supervised Fine-Tuning (SFT)** bridges that gap.
+
+The trick is surprisingly close to what you already built:
+
+1. **Add Conversation Structure (Chat Templates & Special Tokens)**: Just as [`src/tokenizer.py`](../src/tokenizer.py) reserves `<|endoftext|>` to mark document boundaries, conversational models add special role tokens to pack multi-turn dialogues into one flat token stream:
+   ```text
+   <|system|> You are a helpful assistant who speaks clearly. <|end|>
+   <|user|> Summarize Hamlet in one sentence. <|end|>
+   <|assistant|> A Danish prince wrestles with grief and doubt while avenging his father's murder. <|end|>
+   ```
+2. **Train on Curated Prompt–Response Examples**: Researchers assemble high-quality questions, instructions, coding tasks, and multi-turn chats — written by humans or distilled and verified from stronger models — formatted with that chat template.
+3. **Mask the Loss on User Turns**: SFT runs the **exact same next-token cross-entropy loss** as pretraining (usually with a smaller learning rate so the model keeps its pretrained knowledge), with one crucial twist: loss is **only computed on the `<|assistant|>` tokens** while user and system tokens are ignored. The model isn't graded on guessing what the user will ask — only on giving a great answer and knowing when to emit `<|end|>` to stop talking!
+4. **Tool Use & Agentic Workflows**: Using this same template idea, SFT can also teach a model special syntax to call external tools — running code, searching the web, reading files, or calling APIs — pausing to inspect the tool's output before answering.
+
+> **Could you extend Chat Shakespeare with SFT?**  
+> Yes! Because SFT uses the exact same GPT architecture and training loop, a great next project after mastering this repo is starting from a pretrained checkpoint (`--init-from gpt2` or your own scratch run), wrapping Q&A pairs in `<|user|>` / `<|assistant|>` tags, masking out the user tokens with `F.cross_entropy(..., ignore_index=-100)`, and fine-tuning a mini conversational Shakespeare bot!
+
+### Post-Training with Reinforcement Learning: Alignment and Reasoning
+
+SFT teaches a model *how* to talk like an assistant by imitating example answers. But imitation alone has two limits: a model can sound polite while confidently making things up, and it struggles when a hard problem requires planning, trial-and-error, or self-correction. That is where **Reinforcement Learning (RL)** comes in.
+
+- **Preference Alignment (RLHF & DPO)**: Instead of writing one "perfect" answer for every prompt, humans (and carefully calibrated AI judges) compare two candidate responses from the model and pick which one is more helpful, accurate, steerable, and safe. Methods like **RLHF** (*Reinforcement Learning from Human Feedback*, using a learned reward model) and **DPO** (*Direct Preference Optimization*, which optimizes directly on preference pairs) nudge the model's probabilities toward better answers and away from unhelpful or fabricated ones.
+- **RL for Reasoning & "Thinking Tokens"**: One of the biggest breakthroughs behind modern frontier models like Gemini 4 is training with **verifiable rewards** on tasks with objective pass/fail checks — like math problems with exact answers, logic puzzles, or software engineering tasks backed by automated test suites. When the model is rewarded purely for arriving at a verified right answer, it learns to spend internal **"thinking tokens"** before replying: breaking tough problems into steps, testing hypotheses, catching bugs in its own draft, and self-correcting. Modern models can even adjust their **thinking budget** on the fly — answering simple questions immediately while dedicating deep internal reasoning to hard ones.
+
+### Latest Neural Network Architectures: MoE, Smarter Attention, and Beyond
+
+First, give yourself credit: Chat Shakespeare's default `arch="modern"` in [`src/model.py`](../src/model.py) is **already much closer to a modern LLM than 2019 GPT-2**! It uses `RoPE`, `RMSNorm`, `QK-Norm`, `ReLU²`, fused FlashAttention via `F.scaled_dot_product_attention`, `bf16` mixed precision, and KV-cached generation.
+
+When scaling up to frontier models like Gemini 4, researchers layer on several newer architectural upgrades to boost intelligence without letting memory or latency explode:
+
+- **Sparse Mixture-of-Experts (MoE)**: In Chat Shakespeare, every token passes through the exact same MLP weights in every layer — a **dense** Transformer. Making a dense model 10× bigger usually makes it ~10× slower. **Sparse MoE** (used in flagship Gemini 4 models) replaces each block's single MLP with a pool of many specialized "expert" MLPs plus a tiny **router** network. For each token, the router activates only a small handful of experts. The model gains massive total knowledge capacity while keeping active compute per token fast and practical.
+- **Memory-Efficient Attention (`GQA` and `MLA`)**: Recall from Step 5 that [`KVCache`](../src/model.py#L107-L142) stores past Key and Value vectors for every attention head. At a million tokens of context, a naive KV cache can consume tens of gigabytes of memory per user!
+  - **Grouped-Query Attention (GQA)** lets groups of Query heads share a smaller number of Key and Value heads, dramatically shrinking the KV cache with almost no quality loss.
+  - **Multi-Head Latent Attention (MLA)** goes even further by compressing Keys and Values into a compact shared latent vector before caching them.
+- **Long-Context & Hybrid Architectures (Sliding Window & State Space Models)**: Standard causal self-attention compares every token to every earlier token, so compute grows quadratically (`O(T²)`) with sequence length. Newer architectures sidestep this bottleneck by **alternating local sliding-window attention** (each token only attends to nearby neighbors) with periodic **global attention** layers — or by mixing Transformer attention blocks with linear-time recurrent layers such as **State Space Models (SSMs)** (like Mamba) and linear-attention variants that process long sequences in `O(T)` time.
+- **Gated MLPs (`SwiGLU`)**: While `ReLU²` shines on compact models like Chat Shakespeare, many large frontier Transformers use gated feed-forward layers like **SwiGLU**, which add a third learned "gate" projection inside the MLP so the network can smoothly control which features pass through.
+- **Faster Decoding & Multi-Token Prediction**: Chat Shakespeare generates strictly one token at a time. At production scale, techniques like **Multi-Token Prediction** (training the model to predict several future tokens at once) and **Speculative Decoding** (having a tiny, ultra-fast draft model propose the next few tokens while the large model verifies them all in one parallel forward pass) speed up generation dramatically without changing the output distribution.
+
+### From Model to Agent: Harnesses, MCP, Skills, and Orchestration
+
+Even the smartest trained model weights (`model.safetensors`) are just a brain in a jar — by themselves they can only take tokens in and emit tokens out. Turning an LLM like Gemini 4 into a practical assistant or coding agent requires a software layer built *around* the model:
+
+- **Agent Harness**: In Chat Shakespeare, [`src/sample.py`](../src/sample.py) is the simplest possible wrapper: pass a prompt in, print generated tokens out. An **agent harness** upgrades that single pass into a continuous **observe → think → act** loop. It manages the conversation state and context window (trimming or compacting long histories), runs the tools the model requests inside safe sandboxes, enforces permissions and guardrails, and feeds real-world results (file edits, terminal output, test failures) right back into the next turn until the goal is finished.
+- **MCP (Model Context Protocol)**: Think of **MCP** as a "USB-C port for AI tools and data." Instead of writing one-off glue code to connect every AI app to every external service, MCP defines an open standard so any harness can plug into external tools, databases, docs, calendars, issue trackers, and local files through reusable **MCP servers**.
+- **Skills (and Customizations)**: You don't need to retrain or fine-tune a model's weights every time you want it to follow a specialized team workflow. **Skills** are modular bundles of instructions, best practices, templates, and helper scripts stored on disk that an agent dynamically loads *only* when a relevant task comes up — giving the model instant domain expertise without cluttering every prompt.
+- **Agent Orchestration**: Big, open-ended tasks often outgrow a single linear conversation. **Agent orchestration** coordinates multiple specialized agents working together — for example, a lead planner spinning up background **subagents** in parallel to research a codebase, run experiments, write tests, or edit isolated branches, then passing messages back and merging verified results.
+
+#### Other Notable Topics in the LLM Ecosystem
+As you explore further beyond Chat Shakespeare, you will also run into these closely related ideas — several of which connect directly to concepts you already saw in this repo:
+
+- **RAG (Retrieval-Augmented Generation) & Context Engineering**: Rather than forcing a model to memorize every private document in its weights, RAG searches a knowledge base or codebase on the fly and injects only the relevant snippets into the prompt. **Context engineering** is the broader craft of deciding *what* information, memory, and tool outputs belong in the model's context window at each step.
+- **Structured Outputs**: Constrained decoding restricts which tokens are allowed at each sampling step (just like `valid_vocab_size` masking in [`src/sample.py`](../src/sample.py)!) so an LLM is guaranteed to emit valid JSON or match a strict schema for reliable software integration.
+- **Quantization & Inference Serving Engines**: Shrinking weights from 16-bit floats down to 8-bit or 4-bit numbers (`FP8`, `INT8`, `INT4`) cuts memory and speeds up generation, while production serving engines (like vLLM or SGLang) combine paged KV caching and continuous batching to serve thousands of users at once.
+- **Evals & Benchmarks**: In [`src/train.py`](../src/train.py), we track `val loss` to see how well the model predicts Shakespeare tokens. For real assistants and agents, teams run **evals** — automated test suites grading real-world coding, math, instruction following, safety, and multi-step tool use.
+
+> **The Encouraging Takeaway:**  
+> Even with Mixture-of-Experts routing, million-token multimodal contexts, SFT chat templates, reinforcement-learned reasoning, and full MCP-powered agent harnesses, **the core engine inside a frontier LLM like Gemini 4 is still the exact Transformer loop you just learned in [`src/model.py`](../src/model.py) and [`src/train.py`](../src/train.py)**: token embeddings, causal attention, MLPs, residual connections, normalization, and next-token cross-entropy loss. Once you understand Chat Shakespeare, every advanced LLM paper — and every agent framework built around it — is an upgrade on top of a machine you already know inside and out!
 
 ---
 
