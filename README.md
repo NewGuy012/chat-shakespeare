@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-  A minimal GPT built from scratch in PyTorch. Train a small language model on Shakespeare and generate new plays in a <a href="https://marimo.io">marimo</a> notebook or from the terminal.
+  A small GPT language model built from scratch in PyTorch. Train it on Shakespeare and generate new plays in a <a href="https://marimo.io">marimo</a> notebook or from your terminal.
 </p>
 
 <p align="center">
@@ -15,15 +15,15 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--2--Clause-2563EB" alt="BSD-2-Clause License" /></a>
 </p>
 
-- **Interactive or terminal workflow**: Explore step by step in the [`main.py`](main.py) notebook, or run [`src/train.py`](src/train.py) from the CLI.
-- **Automatic hardware tuning**: [`TrainConfig.auto()`](src/hyperparameters.py) picks a model size, precision, and batch settings for your CPU, Apple Silicon (`mps`), or NVIDIA GPU (`cuda`).
-- **From scratch or GPT-2**: Train a modern mini-GPT from scratch on Tiny Shakespeare, or fine-tune pretrained GPT-2 weights stored safely as `safetensors`.
+- **Notebook or terminal**: Run [`main.py`](main.py) as an interactive notebook to explore each step, or run [`src/train.py`](src/train.py) in your terminal.
+- **Works on your hardware**: Automatically picks a good model size and speed settings for your CPU, Mac (Apple Silicon), or NVIDIA GPU.
+- **From scratch or GPT-2**: Train a mini-GPT from scratch on Tiny Shakespeare, or start from pretrained GPT-2 weights.
 
-> **New to LLMs?** Start with the **[Beginner's Guide](docs/concepts.md)** for a plain-English walkthrough of tokenization, Transformers, training, and sampling.
+> **New to LLMs?** Read **[`docs/concepts.md`](docs/concepts.md)** for a plain-English guide to how GPT works (tokens, attention, training, and text generation), 6 hands-on experiments, and how modern frontier LLMs build on these basics.
 
 ## Quickstart
 
-Requires Python `>=3.14` and [`uv`](https://docs.astral.sh/uv/) (handles virtual environments and dependencies automatically).
+Requires Python `>=3.14` and [`uv`](https://docs.astral.sh/uv/) (which sets up the environment and packages for you).
 
 ### 1. Install
 
@@ -39,15 +39,15 @@ uv sync
 uv run marimo edit main.py
 ```
 
-This opens a 5-cell notebook that downloads Tiny Shakespeare, tokenizes it, trains your model, and generates sample text. You can edit the prompt or `temperature` in the last cell anytime without retraining—cached tokens and checkpoints are reused automatically.
+This opens a 5-step notebook that downloads Shakespeare, prepares the text, trains your model, and writes sample dialogue. You can change the starting prompt or creativity (`temperature`) in the last cell anytime without retraining—saved progress is reused automatically.
 
-### 3. Or Train & Generate from the Terminal
+### 3. Or Train & Generate in the Terminal
 
 ```bash
-# Train with automatic settings for your machine (CPU, Apple Silicon, or CUDA GPU)
+# Train with automatic settings for your machine
 uv run python src/train.py
 
-# Generate Shakespeare from the saved checkpoint
+# Generate Shakespeare from the trained model
 uv run python -c "import sys; sys.path.insert(0, 'src'); from hyperparameters import TrainConfig; from sample import SampleConfig, sample; sample(TrainConfig.auto(), SampleConfig(start='ROMEO:\n'))"
 ```
 
@@ -58,24 +58,24 @@ uv run python src/train.py --init-from gpt2 --lr 3e-4
 ```
 
 <details>
-<summary>Advanced CLI options, tests, and cloud GPU tips</summary>
+<summary>More options: multiple GPUs, tests, and cloud GPU tips</summary>
 
 ```bash
-# Classic GPT-2 architecture or early stopping on validation loss plateau
+# Use the classic GPT-2 design, or stop early if training stops improving
 uv run python src/train.py --arch gpt2 --early-stopping 3
 
-# Multi-GPU or explicit CPU launch with Hugging Face Accelerate
+# Run on multiple GPUs, or force CPU mode
 uv run accelerate launch --multi_gpu --mixed_precision bf16 src/train.py
 uv run accelerate launch --cpu src/train.py
 
-# See all CLI flags
+# See all command-line options
 uv run python src/train.py --help
 
-# Run the test suite
+# Run tests
 uv run python -m unittest discover -s tests
 ```
 
-- **Cloud GPU / CUDA tips:** Persist `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, and `TORCHINDUCTOR_FX_GRAPH_CACHE=1` across restarts to skip `torch.compile` warmup. [`uv.lock`](uv.lock) resolves PyTorch `2.15` CUDA 13 (`cu13`) wheels on Linux; on older CUDA 12 drivers, point `[tool.uv.sources]` in [`pyproject.toml`](pyproject.toml) at a matching PyTorch CUDA index.
+- **Cloud GPU tips:** The first GPU run takes a little longer while PyTorch optimizes code for your graphics card—pass `--no-compile` to skip this for quick tests, or keep your cache folder on persistent storage so restarts stay fast. Linux installs PyTorch for CUDA 13 by default; if a cloud GPU uses CUDA 12, configure a CUDA 12 PyTorch source in [`pyproject.toml`](pyproject.toml).
 
 </details>
 
@@ -84,23 +84,23 @@ uv run python -m unittest discover -s tests
 ### Interactive marimo notebook (`main.py`)
 ![marimo notebook training and sample output](docs/marimo-notebook.png)
 
-### CLI training & sampling on Apple Silicon (`mps`, `bf16`)
+### Terminal training & text generation on Mac (Apple Silicon)
 ![CLI training and sample output](docs/cli-sample.png)
 
-## Hardware Presets & Project Layout
+## Default Settings by Hardware & Project Files
 
-`TrainConfig.auto()` automatically scales the model for your device (plus batch size and learning rate tiers on CUDA):
+The code automatically scales the model to fit your device (and adjusts batch size for NVIDIA GPU memory):
 
-| Hardware | Model Size | Context Window | Precision |
+| Hardware | Model Size | Context Length | Precision |
 | :--- | :--- | ---: | :--- |
-| CPU | ~0.92M params (`4` layers) | 128 tokens | `fp32` |
-| Apple Silicon (`mps`) | ~11.02M params (`6` layers) | 256 tokens | `bf16` |
-| NVIDIA GPU (`cuda`) | ~11.02M params (`6` layers) | 256 tokens | `bf16` / `fp16` (+ `torch.compile`) |
+| CPU | ~0.92M params (`4` layers) | 128 tokens | Standard (`fp32`) |
+| Apple Silicon Mac | ~11.02M params (`6` layers) | 256 tokens | Fast 16-bit (`bf16`) |
+| NVIDIA GPU | ~11.02M params (`6` layers) | 256 tokens | Fast 16-bit (`bf16` / `fp16`) |
 
-- [`main.py`](main.py) — Interactive 5-cell marimo notebook
-- [`src/`](src) — Core modules (`tokenizer.py`, `model.py`, `train.py`, `sample.py`, `hyperparameters.py`)
-- [`docs/concepts.md`](docs/concepts.md) — Beginner's guide, detailed [hardware presets](docs/concepts.md#44-hardware-tricks-presets-mixed-precision-accumulation-and-accelerate), and [code reading map](docs/concepts.md#code-reading-map)
-- `data/` — Cached dataset, tokens, and checkpoints (created on first run)
+- [`main.py`](main.py) — Interactive 5-step marimo notebook (best place to start)
+- [`src/`](src) — Core Python code for tokenizing, model building, training, and generating text
+- [`docs/concepts.md`](docs/concepts.md) — Beginner's guide, 6 hands-on experiments, full [hardware preset details](docs/concepts.md#44-hardware-tricks-presets-mixed-precision-accumulation-and-accelerate), and [code reading map](docs/concepts.md#code-reading-map)
+- `data/` — Downloaded text, tokens, and saved models (created automatically on first run)
 
 ---
 
